@@ -29,10 +29,10 @@ Ray ray_to_camera(
         int cropX = canvasConfig[4];
         int cropY = canvasConfig[5];
 
-        float halfWidth = fullWidth / (2.0 * fullHeight);
-        float invHeight = 1.0 / fullHeight;
+        float halfWidth = fullWidth / (2.0f * fullHeight);
+        float invHeight = 1.0f / fullHeight;
         float x = -halfWidth + ((gid % width) + Random_nextFloat(random) + cropX) * invHeight;
-        float y = -0.5 + ((gid / width) + Random_nextFloat(random) + cropY) * invHeight;
+        float y = -0.5f + ((gid / width) + Random_nextFloat(random) + cropY) * invHeight;
 
         switch (*projectorType) {
             case 0:
@@ -107,8 +107,8 @@ __kernel void render(
     ray.material = 0;
     ray.flags = 0;
 
-    float3 color = (float3) (0.0);
-    float3 throughput = (float3) (1.0);
+    float3 color = (float3) (0.0f);
+    float3 throughput = (float3) (1.0f);
 
     for (int depth = 0; depth < *rayDepth; depth++) {
         IntersectionRecord record = IntersectionRecord_new();
@@ -203,7 +203,7 @@ __kernel void preview(
 
     float3 color;
     if (closestIntersect(scene, textureAtlas, ray, &record, &sample, &material)) {
-        float shading = dot(record.normal, (float3) (0.25, 0.866, 0.433));
+        float shading = dot(record.normal, (float3) (0.25f, 0.866f, 0.433f));
         shading = fmax(0.3f, shading);
         color = sample.color.xyz * shading;
     } else {

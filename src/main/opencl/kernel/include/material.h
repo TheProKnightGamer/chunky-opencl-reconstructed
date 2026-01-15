@@ -58,8 +58,8 @@ bool Material_sample(Material self, image2d_array_t atlas, float2 uv, MaterialSa
     
     if (self.tint == 0xFE000000) {
         // Light block
-        sample->color.xyz = 0.5;
-        sample->color.w = 1.0;
+        sample->color.xyz = 0.5f;
+        sample->color.w = 1.0f;
     } else if (color.w > EPS) {
         sample->color = color;
     } else {
@@ -89,7 +89,7 @@ bool Material_sample(Material self, image2d_array_t atlas, float2 uv, MaterialSa
     if (self.flags & 0b010)
         sample->emittance = Atlas_read_uv(uv.x, uv.y, self.normal_emittance, self.textureSize, atlas).w;
     else
-        sample->emittance = (self.normal_emittance & 0xFF) / 255.0;
+        sample->emittance = (self.normal_emittance & 0xFF) / 255.0f;
 
     // specular, metalness, roughness
     if (self.flags & 0b001) {
@@ -98,9 +98,9 @@ bool Material_sample(Material self, image2d_array_t atlas, float2 uv, MaterialSa
         sample->metalness = smr.y;
         sample->roughness = smr.z;
     } else {
-        sample->specular = (self.specular_metalness_roughness & 0xFF) / 255.0;
-        sample->metalness = ((self.specular_metalness_roughness >> 8) & 0xFF) / 255.0;
-        sample->roughness = ((self.specular_metalness_roughness >> 16) & 0xFF) / 255.0;
+        sample->specular = (self.specular_metalness_roughness & 0xFF) / 255.0f;
+        sample->metalness = ((self.specular_metalness_roughness >> 8) & 0xFF) / 255.0f;
+        sample->roughness = ((self.specular_metalness_roughness >> 16) & 0xFF) / 255.0f;
     }
     
     return true;
@@ -121,7 +121,7 @@ float3 _Material_diffuseReflection(IntersectionRecord record, Random random) {
     float ux, uy, uz;
     float vx, vy, vz;
 
-    if (fabs(record.normal.x) > 0.1) {
+    if (fabs(record.normal.x) > 0.1f) {
         xx = 0;
         xy = 1;
     } else {

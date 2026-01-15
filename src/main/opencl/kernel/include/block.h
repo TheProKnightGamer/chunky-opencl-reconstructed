@@ -95,7 +95,7 @@ bool BlockPalette_intersectNormalizedBlock(BlockPalette self, image2d_array_t at
                 hit = AABB_full_intersect(box, tempRay, &tempRecord);
                 tempRecord.material = modelPointer;
             } else if (ray.flags & RAY_INDIRECT) {
-                AABB box = AABB_new(0.125, 0.875, 0.125, 0.875, 0.125, 0.875);
+                AABB box = AABB_new(0.125f, 0.875f, 0.125f, 0.875f, 0.125f, 0.875f);
                 hit = AABB_full_intersect(box, tempRay, &tempRecord);
                 tempRecord.material = modelPointer;
             } else {

@@ -51,7 +51,7 @@ bool Sun_intersect(Sun self, image2d_array_t atlas, Ray ray, MaterialSample* sam
         return false;
     }
 
-    float radius = 0.03;
+    float radius = 0.03f;
 
     float width = radius * 4;
     float width2 = width * 2;
@@ -112,7 +112,7 @@ void Sky_intersect(image2d_t skyTexture, float skyIntensity, Ray ray, MaterialSa
     float phi = (asin(clamp(direction.y, -1.0f, 1.0f)) + M_PI_2_F) * M_1_PI_F;
 
     sample->color = read_imagef(skyTexture, skySampler, (float2) (theta, phi)) * skyIntensity;
-    sample->emittance = 1.0;
+    sample->emittance = 1.0f;
 }
 
 #endif

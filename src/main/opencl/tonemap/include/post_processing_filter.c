@@ -23,7 +23,7 @@ __kernel void filter(
     switch (type) {
         case 0:
             // GAMMA
-            color = pow(color, 1.0 / 2.2);
+            color = pow(color, 1.0f / 2.2f);
             break;
         case 1:
             // TONEMAP1
@@ -34,7 +34,7 @@ __kernel void filter(
             // ACES
             color = (color * (2.51f * color + 0.03f)) / (color * (2.43f * color + 0.59f) + 0.14f);
             color = clamp(color, (float3)(0), (float3)(1));
-            color = pow(color, 1.0 / 2.2);
+            color = pow(color, 1.0f / 2.2f);
             break;
         case 3:
             // HABLE
@@ -55,7 +55,7 @@ float ue4_filter_process_component(float c, float saturation, float slope, float
     float logc = log10(c);
 
     if (logc >= ta && logc <= sa) {
-        return saturation * (slope * (logc + 0.733) + 0.18);
+        return saturation * (slope * (logc + 0.733f) + 0.18f);
     }
     if (logc > sa) {
         return saturation * (1 + whiteClip - (2 * (1 + whiteClip - shoulder)) / (1 + exp(((2 * slope) / (1 + whiteClip - shoulder)) * (logc - sa))));
@@ -95,7 +95,7 @@ __kernel void ue4_filter(
         ue4_filter_process_component(color.z, saturation, slope, toe, shoulder, blackClip, whiteClip, ta, sa)
     );
     color = clamp(color, 0.0f, 1.0f);
-    color = pow(color, 1.0 / 2.0);
+    color = pow(color, 1.0f / 2.0f);
 
     float4 pixel;
     pixel.xyz = color;
