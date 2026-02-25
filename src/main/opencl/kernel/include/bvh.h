@@ -27,9 +27,12 @@ bool Bvh_intersect(Bvh self, image2d_array_t atlas, MaterialPalette palette, Ray
     int nodesToVisit[64];
     int node[7];
     AABB box;
-    float3 invDir = 1 / ray.direction;
+    // Guard against NaN in invDir: if direction component is zero, use large
+    // finite value instead of infinity to prevent NaN in AABB intersections.
+    float3 invDir = select(1.0f / ray.direction, (float3)(1e30f), fabs(ray.direction) < 1e-30f);
 
-    while (true) {
+    // Bounded loop prevents GPU hang on corrupted BVH data (max 4096 nodes)
+    for (int _bvhIter = 0; _bvhIter < 4096; _bvhIter++) {
         node[0] = self.bvh[currentNode];
 
         if (node[0] <= 0) {
@@ -37,7 +40,7 @@ bool Bvh_intersect(Bvh self, image2d_array_t atlas, MaterialPalette palette, Ray
             int primIndex = -node[0];
             int numPrim = self.trigs[primIndex];
 
-            for (int i = 0; i < numPrim; i++) {
+            for (int i = 0; i < min(numPrim, 256); i++) {
                 Triangle trig = Triangle_new(self.trigs, primIndex + 1 + TRIANGLE_SIZE * i);
                 hit |= Triangle_intersect(trig, atlas, palette, ray, record, sample);
             }
@@ -76,10 +79,10 @@ bool Bvh_intersect(Bvh self, image2d_array_t atlas, MaterialPalette palette, Ray
             } else if (isnan(t2) || t2 > record->distance) {
                 currentNode += 7;
             } else if (t1 < t2) {
-                nodesToVisit[toVisit++] = offset;
+                if (toVisit < 63) { nodesToVisit[toVisit++] = offset; }
                 currentNode += 7;
             } else {
-                nodesToVisit[toVisit++] = currentNode + 7;
+                if (toVisit < 63) { nodesToVisit[toVisit++] = currentNode + 7; }
                 currentNode = offset;
             }
         }

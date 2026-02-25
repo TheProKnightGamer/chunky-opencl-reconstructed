@@ -25,6 +25,11 @@ public class ClMemory implements AutoCloseable {
 
     @Override
     public void close() {
+        // Clean native resource and unregister the cleaner to avoid retaining it
+        // in the NativeCleaner list (prevents a memory leak when many resources
+        // are allocated and closed explicitly).
         this.cleaner.clean();
+        NativeCleaner.INSTANCE.unregister(this.cleaner);
+        this.valid = false;
     }
 }

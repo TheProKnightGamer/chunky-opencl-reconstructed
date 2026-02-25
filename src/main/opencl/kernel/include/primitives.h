@@ -334,7 +334,8 @@ bool Quad_intersect(Quad self, image2d_array_t atlas, MaterialPalette materialPa
                 Material material = Material_get(materialPalette, self.material);
                 if (Material_sample(material, atlas, texCoord, sample)) {
                     record->texCoord = texCoord;
-                    record->normal = n;
+                    // Flip normal to face the ray for double-sided quads (matching CPU orientNormal)
+                    record->normal = (doubleSided && denom > 0) ? -n : n;
                     record->distance = t;
                     record->material = self.material;
                     return true;

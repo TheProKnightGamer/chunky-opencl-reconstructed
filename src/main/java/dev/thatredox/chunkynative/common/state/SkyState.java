@@ -31,6 +31,12 @@ public class SkyState {
     private final double sunAltitude;
     private final boolean drawSun;
     private final Vector3 sunColor;
+    private final double sunRadius;
+    private final double apparentBrightness;
+    private final boolean modifySunTexture;
+    private final Vector3 apparentSunColor;
+    private final double importanceSampleChance;
+    private final double importanceSampleRadius;
 
     public SkyState(Sky sky, Sun sun) {
         skymap = Reflection.getFieldValue(sky, "skymap", Texture.class);
@@ -50,6 +56,12 @@ public class SkyState {
         sunAltitude = sun.getAltitude();
         drawSun = sun.drawTexture();
         sunColor = new Vector3(sun.getColor());
+        sunRadius = sun.getSunRadius();
+        apparentBrightness = sun.getApparentBrightness();
+        modifySunTexture = sun.getEnableTextureModification();
+        apparentSunColor = new Vector3(sun.getApparentColor());
+        importanceSampleChance = sun.getImportanceSampleChance();
+        importanceSampleRadius = sun.getImportanceSampleRadius();
 
         rotation = new Matrix3();
         Matrix3 rot = Reflection.getFieldValue(sky, "rotation", Matrix3.class);
@@ -71,6 +83,12 @@ public class SkyState {
         if (Double.compare(skyState.sunAzimuth, sunAzimuth) != 0) return false;
         if (Double.compare(skyState.sunAltitude, sunAltitude) != 0) return false;
         if (drawSun != skyState.drawSun) return false;
+        if (Double.compare(skyState.sunRadius, sunRadius) != 0) return false;
+        if (Double.compare(skyState.apparentBrightness, apparentBrightness) != 0) return false;
+        if (modifySunTexture != skyState.modifySunTexture) return false;
+        if (!StateUtil.equals(apparentSunColor, skyState.apparentSunColor)) return false;
+        if (Double.compare(skyState.importanceSampleChance, importanceSampleChance) != 0) return false;
+        if (Double.compare(skyState.importanceSampleRadius, importanceSampleRadius) != 0) return false;
         if (!Objects.equals(skymap, skyState.skymap)) return false;
         if (!StateUtil.equals(skybox, skyState.skybox, Objects::equals)) return false;
         if (!Objects.equals(skymapFileName, skyState.skymapFileName)) return false;

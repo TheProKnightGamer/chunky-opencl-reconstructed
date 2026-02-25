@@ -35,8 +35,22 @@ public class ClPackedResourcePalette<T extends Packer> implements ResourcePalett
         return build().get();
     }
 
+    /** Number of ints in the packed palette. */
+    public int wordCount() {
+        return palette.size();
+    }
+
     @Override
     public void close() {
-        buffer.close();
+        release();
+    }
+
+    @Override
+    public void release() {
+        if (buffer != null) {
+            buffer.close();
+            buffer = null;
+        }
+        palette.clear();
     }
 }

@@ -30,7 +30,7 @@ public class ClSky implements AutoCloseable {
                 Pointer.to(new float[] {(float) scene.sun().getIntensity()}), null));
 
         cl_image_format fmt = new cl_image_format();
-        fmt.image_channel_data_type = CL_UNORM_INT8;
+        fmt.image_channel_data_type = CL_FLOAT;
         fmt.image_channel_order = CL_RGBA;
 
         cl_image_desc desc = new cl_image_desc();
@@ -38,7 +38,7 @@ public class ClSky implements AutoCloseable {
         desc.image_width = textureResolution;
         desc.image_height = textureResolution;
 
-        byte[] texture = new byte[textureResolution * textureResolution * 4];
+        float[] texture = new float[textureResolution * textureResolution * 4];
         Ray ray = new Ray();
         for (int i = 0; i < textureResolution; i++) {
             for (int j = 0; j < textureResolution; j++) {
@@ -49,11 +49,13 @@ public class ClSky implements AutoCloseable {
                 double r = FastMath.cos(phi);
                 ray.d.set(FastMath.cos(theta) * r, FastMath.sin(phi), FastMath.sin(theta) * r);
 
-                scene.sky().getSkyColor(ray, false);
-                texture[offset + 0] = (byte) (ray.color.x * 255);
-                texture[offset + 1] = (byte) (ray.color.y * 255);
-                texture[offset + 2] = (byte) (ray.color.z * 255);
-                texture[offset + 3] = (byte) 255;
+                // Respect scene sun sampling "diffuse sun" setting when baking sky texture
+                boolean includeSunInDiffuse = scene.getSunSamplingStrategy().isDiffuseSun();
+                scene.sky().getSkyColor(ray, includeSunInDiffuse);
+                texture[offset + 0] = (float) ray.color.x;
+                texture[offset + 1] = (float) ray.color.y;
+                texture[offset + 2] = (float) ray.color.z;
+                texture[offset + 3] = 1.0f;
             }
         }
 

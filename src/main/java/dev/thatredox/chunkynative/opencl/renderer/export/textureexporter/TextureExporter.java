@@ -1,5 +1,6 @@
 package dev.thatredox.chunkynative.opencl.renderer.export.textureexporter;
 
+import se.llbit.chunky.resources.AnimatedTexture;
 import se.llbit.chunky.resources.SignTexture;
 import se.llbit.chunky.resources.Texture;
 
@@ -13,6 +14,9 @@ public interface TextureExporter {
     static TextureExporter getExporter(Texture texture) {
         if (texture instanceof SignTexture) {
             return new SignTextureExporter((SignTexture) texture);
+        }
+        if (texture instanceof AnimatedTexture) {
+            return new AnimatedTextureExporter((AnimatedTexture) texture);
         }
         return new DefaultTextureExporter(texture);
     }

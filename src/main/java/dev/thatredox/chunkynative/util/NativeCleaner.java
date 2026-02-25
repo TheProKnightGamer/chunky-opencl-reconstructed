@@ -41,6 +41,15 @@ public class NativeCleaner extends Thread {
         return cleaner;
     }
 
+    /**
+     * Unregister a previously registered cleaner. This removes the cleaner from the
+     * internal list so it does not retain a strong reference after being cleaned
+     * manually (e.g. when native resources are closed explicitly).
+     */
+    public void unregister(Cleaner cleaner) {
+        this.cleaners.remove(cleaner);
+    }
+
     @Override
     public void run() {
         try {

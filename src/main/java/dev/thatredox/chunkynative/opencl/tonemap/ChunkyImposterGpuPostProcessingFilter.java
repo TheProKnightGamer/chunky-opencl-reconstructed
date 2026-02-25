@@ -12,7 +12,8 @@ public class ChunkyImposterGpuPostProcessingFilter extends SimpleGpuPostProcessi
         GAMMA(0),
         TONEMAP1(1),
         ACES(2),
-        HABLE(3);
+        HABLE(3),
+        NONE(4);
 
         public final int id;
         Filter(int id) {

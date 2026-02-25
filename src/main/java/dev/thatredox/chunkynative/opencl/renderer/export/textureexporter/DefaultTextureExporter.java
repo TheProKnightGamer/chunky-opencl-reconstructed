@@ -28,10 +28,10 @@ public class DefaultTextureExporter implements TextureExporter {
         for (int y = 0; y < getHeight(); y++) {
             for (int x = 0; x < getWidth(); x++) {
                 float[] rgba = texture.getColor(x, y);
-                out[index] = (byte) (rgba[0] * 255.0);
-                out[index+1] = (byte) (rgba[1] * 255.0);
-                out[index+2] = (byte) (rgba[2] * 255.0);
-                out[index+3] = (byte) (rgba[3] * 255.0);
+                out[index] = (byte) (rgba[0] * 255.0f);
+                out[index+1] = (byte) (rgba[1] * 255.0f);
+                out[index+2] = (byte) (rgba[2] * 255.0f);
+                out[index+3] = (byte) (rgba[3] * 255.0f);
                 index += 4;
             }
         }

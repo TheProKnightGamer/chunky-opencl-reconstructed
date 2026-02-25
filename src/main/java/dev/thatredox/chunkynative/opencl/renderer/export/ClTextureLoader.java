@@ -30,7 +30,15 @@ public class ClTextureLoader extends AbstractTextureLoader implements AutoClosea
 
     @Override
     public void close() {
-        texture.close();
+        release();
+    }
+
+    @Override
+    public void release() {
+        if (texture != null) {
+            texture.close();
+            texture = null;
+        }
     }
 
     @Override

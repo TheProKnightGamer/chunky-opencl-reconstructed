@@ -42,6 +42,9 @@ __kernel void filter(
             color = ((color * (0.15f * color + 0.10f * 0.50f) + 0.20f * 0.02f) / (color * (0.15f * color + 0.50f) + 0.20f * 0.30f)) - 0.02f / 0.30f;
             color /= (((11.2f * (0.15f * 11.2f + 0.10f * 0.50f) + 0.20f * 0.02f) / (11.2f * (0.15f * 11.2f + 0.50f) + 0.20f * 0.30f)) - 0.02f / 0.30f);
             break;
+        default:
+            // NONE: exposure already applied above, color_to_argb clamps to [0,1]
+            break;
     }
 
     float4 pixel;
