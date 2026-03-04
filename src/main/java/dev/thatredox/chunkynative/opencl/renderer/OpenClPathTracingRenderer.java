@@ -49,7 +49,6 @@ public class OpenClPathTracingRenderer implements Renderer {
         ClSceneLoader sceneLoader = context.sceneLoader;
 
         ReentrantLock renderLock = new ReentrantLock();
-        cl_event[] renderEvent = new cl_event[1];
         Scene scene = manager.bufferedScene;
 
         double[] sampleBuffer = scene.getSampleBuffer();
@@ -117,7 +116,9 @@ public class OpenClPathTracingRenderer implements Renderer {
                 // Per-work-group material cache: cache the first N ints of the palette
                 // into __local memory for faster access.  Cap to the actual palette
                 // size so the cooperative copy never reads out-of-bounds.
-                final int matCacheWords = Math.min(2048, sceneLoader.getMaterialPalette().wordCount());
+                // DIAGNOSTIC: disabled (set to 0) to test if __local memory causes the crash.
+                // To re-enable: Math.min(2048, sceneLoader.getMaterialPalette().wordCount())
+                final int matCacheWords = 0;
                 clSetKernelArg(kernel, argIndex++, Sizeof.cl_int, Pointer.to(new int[] { matCacheWords }));
                 // Allocate local memory for the cache (size = matCacheWords * sizeof(uint))
                 clSetKernelArg(kernel, argIndex++, Sizeof.cl_uint * Math.max(matCacheWords, 1), null);
@@ -155,28 +156,34 @@ public class OpenClPathTracingRenderer implements Renderer {
 
                 clSetKernelArg(kernel, argIndex++, Sizeof.cl_mem, Pointer.to(buffer.get()));
 
-                // Warm-up dispatch: force the GPU driver to compile the kernel to
-                // native ISA before the real render loop.  Many drivers (especially
-                // NVIDIA / AMD on Windows) defer final code-generation until the
-                // first clEnqueueNDRangeKernel.  For a complex kernel like this one,
-                // lazy compilation can take several seconds.  If that compilation
-                // happens on a large dispatch (millions of pixels), the combined
-                // compile + execute time exceeds the Windows TDR timeout (~2 s) and
-                // the driver kills the kernel with error -777.  A single-pixel
-                // warm-up separates compilation time from execution time so
-                // subsequent full-size dispatches complete well within TDR.
-                {
-                    int[] warmupCfg = new int[] { 0, 0, 0, 0, 1 }; // seed=0, spp=0, emitters=off, strategy=0, branches=1
-                    clEnqueueWriteBuffer(context.context.queue, dynamicConfig.get(), CL_TRUE, 0,
-                        Sizeof.cl_int * warmupCfg.length, Pointer.to(warmupCfg), 0, null, null);
-                    clEnqueueWriteBuffer(context.context.queue, emitterIntensityMem.get(), CL_TRUE, 0,
-                        Sizeof.cl_float, Pointer.to(new float[]{0.0f}), 0, null, null);
-                    cl_event warmupEvent = new cl_event();
-                    clEnqueueNDRangeKernel(context.context.queue, kernel, 1, null,
-                        new long[]{1}, new long[]{1}, 0, null, warmupEvent);
-                    clWaitForEvents(1, new cl_event[] { warmupEvent });
-                    clReleaseEvent(warmupEvent);
-                }
+                // Query device and kernel resource usage for diagnostics
+                byte[] deviceNameBuf = new byte[256];
+                clGetDeviceInfo(context.context.device.device, CL_DEVICE_NAME,
+                    deviceNameBuf.length, Pointer.to(deviceNameBuf), null);
+                String deviceName = new String(deviceNameBuf).trim().replace("\0", "");
+                long[] deviceLocalMemSize = new long[1];
+                clGetDeviceInfo(context.context.device.device, CL_DEVICE_LOCAL_MEM_SIZE,
+                    Sizeof.cl_ulong, Pointer.to(deviceLocalMemSize), null);
+                long[] deviceMaxComputeUnits = new long[1];
+                clGetDeviceInfo(context.context.device.device, CL_DEVICE_MAX_COMPUTE_UNITS,
+                    Sizeof.cl_uint, Pointer.to(deviceMaxComputeUnits), null);
+                long[] kernelWgSize = new long[1];
+                clGetKernelWorkGroupInfo(kernel, context.context.device.device,
+                    CL_KERNEL_WORK_GROUP_SIZE, Sizeof.size_t, Pointer.to(kernelWgSize), null);
+                long[] kernelLocalMem = new long[1];
+                clGetKernelWorkGroupInfo(kernel, context.context.device.device,
+                    CL_KERNEL_LOCAL_MEM_SIZE, Sizeof.cl_ulong, Pointer.to(kernelLocalMem), null);
+                long[] kernelPrivateMem = new long[1];
+                clGetKernelWorkGroupInfo(kernel, context.context.device.device,
+                    CL_KERNEL_PRIVATE_MEM_SIZE, Sizeof.cl_ulong, Pointer.to(kernelPrivateMem), null);
+                System.err.println("[ChunkyOCL] Device: " + deviceName
+                    + ", compute units: " + deviceMaxComputeUnits[0]
+                    + ", device local mem: " + deviceLocalMemSize[0] + " bytes");
+                System.err.println("[ChunkyOCL] Kernel max WG size: " + kernelWgSize[0]
+                    + ", local mem: " + kernelLocalMem[0] + " bytes"
+                    + ", private mem: " + kernelPrivateMem[0] + " bytes"
+                    + ", pixelCount: " + pixelCount
+                    + ", matCacheWords: " + matCacheWords);
 
                 int bufferSppReal = 0;
                 int logicalSpp = scene.spp;
@@ -188,41 +195,86 @@ public class OpenClPathTracingRenderer implements Renderer {
                 ForkJoinTask<?> cameraGenTask = Chunky.getCommonThreads().submit(() -> 0);
                 ForkJoinTask<?> bufferMergeTask = Chunky.getCommonThreads().submit(() -> 0);
 
+                // --- Adaptive batch sizing ---
+                // Target wall-clock time per kernel dispatch (seconds).
+                // Keeps each dispatch short enough to avoid Windows TDR resets
+                // (~2 s default) while maximising GPU utilisation.
+                final double TARGET_BATCH_SECONDS = 1.0;
+
+                // Calibration: dispatch a small batch to measure per-pixel time.
+                int calibrationSize = Math.min(256, pixelCount);
+                long batchSize = pixelCount; // fallback: full dispatch
+                {
+                    int[] calCfg = new int[] { rand.nextInt(), 0, scene.getEmittersEnabled() ? 1 : 0,
+                        scene.getEmitterSamplingStrategy().ordinal(), scene.getCurrentBranchCount() };
+                    clEnqueueWriteBuffer(context.context.queue, dynamicConfig.get(), CL_TRUE, 0,
+                        Sizeof.cl_int * calCfg.length, Pointer.to(calCfg), 0, null, null);
+                    clEnqueueWriteBuffer(context.context.queue, emitterIntensityMem.get(), CL_TRUE, 0, Sizeof.cl_float,
+                        Pointer.to(new float[]{(float) scene.getEmitterIntensity()}), 0, null, null);
+
+                    cl_event calEvent = new cl_event();
+                    long calStart = System.nanoTime();
+                    clEnqueueNDRangeKernel(context.context.queue, kernel, 1, null,
+                        new long[]{calibrationSize}, null, 0, null, calEvent);
+                    clWaitForEvents(1, new cl_event[] { calEvent });
+                    long calElapsed = System.nanoTime() - calStart;
+                    clReleaseEvent(calEvent);
+
+                    double secondsPerPixel = (double) calElapsed / 1e9 / calibrationSize;
+                    if (secondsPerPixel > 0) {
+                        batchSize = Math.max(1, (long)(TARGET_BATCH_SECONDS / secondsPerPixel));
+                    }
+                    System.err.println("[ChunkyOCL] Calibration: " + calibrationSize + " pixels in "
+                        + String.format("%.3f", calElapsed / 1e6) + " ms → batch size = " + batchSize
+                        + " (of " + pixelCount + " total)");
+                }
+
                 // This is the main rendering loop. This deals with dispatching rendering tasks. The majority of time is spent
                 // waiting for the OpenCL renderer to complete.
                 while (logicalSpp < scene.getTargetSpp()) {
                     renderLock.lock();
-                    renderEvent[0] = new cl_event();
 
                     int currentBranchCount = scene.getCurrentBranchCount();
                     int[] cfg = new int[] { rand.nextInt(), bufferSppReal, scene.getEmittersEnabled() ? 1 : 0, scene.getEmitterSamplingStrategy().ordinal(), currentBranchCount };
+                    boolean dispatchFailed = false;
                     try {
                         clEnqueueWriteBuffer(context.context.queue, dynamicConfig.get(), CL_TRUE, 0,
                             Sizeof.cl_int * cfg.length, Pointer.to(cfg), 0, null, null);
                         clEnqueueWriteBuffer(context.context.queue, emitterIntensityMem.get(), CL_TRUE, 0, Sizeof.cl_float,
                             Pointer.to(new float[]{(float) scene.getEmitterIntensity()}), 0, null, null);
-                        clEnqueueNDRangeKernel(context.context.queue, kernel, 1, null,
-                            new long[]{pixelCount}, null, 0, null,
-                            renderEvent[0]);
-                        clWaitForEvents(1, renderEvent);
-                        clReleaseEvent(renderEvent[0]);
+
+                        // Dispatch in batches to stay within TDR timeout.
+                        // global_work_offset shifts get_global_id(0) so each
+                        // work-item writes to the correct pixel in the output buffer.
+                        long remaining = pixelCount;
+                        long offset = 0;
+                        while (remaining > 0) {
+                            long chunk = Math.min(batchSize, remaining);
+                            cl_event renderEvent = new cl_event();
+                            long batchStart = System.nanoTime();
+                            clEnqueueNDRangeKernel(context.context.queue, kernel, 1,
+                                new long[]{offset}, new long[]{chunk}, null, 0, null, renderEvent);
+                            clWaitForEvents(1, new cl_event[] { renderEvent });
+                            long batchElapsed = System.nanoTime() - batchStart;
+                            clReleaseEvent(renderEvent);
+
+                            // Adapt batch size based on actual elapsed time.
+                            double batchSeconds = batchElapsed / 1e9;
+                            if (batchSeconds > 0) {
+                                double pixelsPerSec = chunk / batchSeconds;
+                                batchSize = Math.max(1, (long)(pixelsPerSec * TARGET_BATCH_SECONDS));
+                            }
+
+                            offset += chunk;
+                            remaining -= chunk;
+                        }
                     } catch (org.jocl.CLException e) {
-                        // Kernel execution failed — query detailed status and break out
-                        try {
-                            int[] execStatus = new int[1];
-                            clGetEventInfo(renderEvent[0], CL_EVENT_COMMAND_EXECUTION_STATUS,
-                                Sizeof.cl_int, Pointer.to(execStatus), null);
-                            System.err.println("[ChunkyOCL] Kernel execution status code: " + execStatus[0]);
-                        } catch (Exception ignored) {}
-                        try { clReleaseEvent(renderEvent[0]); } catch (Exception ignored) {}
                         renderLock.unlock();
                         System.err.println("[ChunkyOCL] OpenCL kernel error: " + e.getMessage());
-                        System.err.println("[ChunkyOCL] This may indicate a GPU timeout (TDR), driver bug, or out-of-bounds access.");
-                        System.err.println("[ChunkyOCL] Try: (1) updating GPU drivers, (2) reducing scene complexity, (3) clearing the OpenCL cache at "
-                            + context.context.getCacheDir());
                         e.printStackTrace();
-                        break;
+                        dispatchFailed = true;
                     }
+                    if (dispatchFailed) break;
                     renderLock.unlock();
                     // Each kernel call contributed iterationsPerLaunch * branchCount samples per pixel
                     bufferSppReal += iterationsPerLaunch * currentBranchCount;
