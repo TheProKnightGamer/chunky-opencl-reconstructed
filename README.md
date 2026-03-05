@@ -1,13 +1,19 @@
 # OpenCL Plugin
 
-This is a plugin for [Chunky](https://github.com/chunky-dev/chunky) which harnesses the power of the GPU with OpenCL 1.2+ to accelerate rendering.
+This is a plugin for [Chunky](https://github.com/chunky-dev/chunky), which harnesses the power of the GPU with OpenCL 1.2+ to accelerate rendering.
 
-#### This is not the original, but a side project. I, myself do not know much Java, so the majority of this is a test to see how well AI can move features from chunky to chunky-opencl
+#### This is not the original, but a side project. I, myself, do not know much Java, so the majority of this is a test to see how well AI can move features from chunky to chunky-opencl
+
+## Features currently implemented:
+ - Full water rendering + settings!
+ - Glass rendering!
+ - Emitter Sampling Strategies!
+ - Sun Sampling Strategies!
 
 ## Installation
 
 ### Note: This requires the `2.5.0` snapshots.
-Download the [latest plugin release](https://github.com/chunky-dev/chunky-opencl/releases) and extract it. In the Chunky Launcher, expand `Advanced Settings` and click on `Manage plugins`. In the `Plugin Manager` window click on `Add` and select the `.jar` file in the extracted zip file. Click on `Save` and start Chunky as usual.
+Download the [latest plugin release](https://github.com/chunky-dev/chunky-opencl-reconstructed/releases) and extract it. In the Chunky Launcher, expand `Advanced Settings` and click on `Manage plugins`. In the `Plugin Manager` window, click on `Add` and select the `.jar` file in the extracted zip file. Click on `Save` and start Chunky as usual.
 
 ![image](https://user-images.githubusercontent.com/42661490/116319916-28ef2580-a76c-11eb-9f93-86d444a349fd.png)
 
@@ -17,7 +23,7 @@ Select `ChunkyCL` as your renderer for the scene in the `Advanced` tab.
 
 ## Performance
 
-Rough performance with a RTX 2070 is around 400 times that of the traditional CPU renderer as of 2022-01-27.
+Rough performance with an RTX 2070 is around 400 times that of the traditional CPU renderer as of 2022-01-27.
 
 Some settings have been added to improve render performance.
 * Indoor scenes should disable sunlight under `Lighting`
@@ -30,11 +36,6 @@ Some settings have been added to improve render performance.
 * Not compatible with the Denoising Plugin.
 
 ---
-
-## Development
-This project is setup to work with IntelliJ and CLion. The base directory is intended to be opened in IntelliJ and the `src/main/opencl` directory in CLion.
-
-For hot reloading, add `-DchunkyClHotReload="<src/main/opencl directory>"` as a JVM option.
 
 ## Copyright & License
 ChunkyCL is Copyright (c) 2021 - 2024, [ThatRedox](https://github.com/ThatRedox) and contributors.
