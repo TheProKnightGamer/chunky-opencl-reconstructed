@@ -59,7 +59,8 @@ public class ClSceneLoader extends AbstractSceneLoader {
     protected ClFloatBuffer waterNormalMapBuffer = null;
     protected int waterNormalMapW = 0;
     protected ClIntBuffer biomeDataBuffer = null;
-    protected int biomeDataSize = 0; // octreeSize for biome 2D grid
+    protected int biomeDataSize = 0; // octreeSize for biome XZ grid
+    protected int biomeYLevels = 1; // number of Y levels in biome data (1 = 2D)
     protected ClIntBuffer chunkBitmapBuffer = null;
     protected int chunkBitmapSize = 0; // chunks per side (octreeSize / 16)
 
@@ -324,9 +325,10 @@ public class ClSceneLoader extends AbstractSceneLoader {
         //                        cloudsEnabled, cloudHeight, cloudSize,
         //                        preventNormalEmitterWithSampling, strictDirectLight,
         //                        fancierTranslucency, transmissivityCap,
-        //                        biomeColorsEnabled, cloudOffsetX, cloudOffsetZ]
+        //                        biomeColorsEnabled, cloudOffsetX, cloudOffsetZ,
+        //                        yMin, yMax, biomeYLevels]
         int sunStrategy = scene.getSunSamplingStrategy().ordinal();
-        float[] renderData = new float[13];
+        float[] renderData = new float[16];
         renderData[0] = (float) sunStrategy;
         renderData[1] = scene.transparentSky() ? 1.0f : 0.0f;
         renderData[2] = 0.0f; // branchCount is now passed via dynamicConfig[4] per-frame
@@ -339,11 +341,14 @@ public class ClSceneLoader extends AbstractSceneLoader {
         renderData[8] = scene.getFancierTranslucency() ? 1.0f : 0.0f;
         renderData[9] = (float) scene.getTransmissivityCap();
         renderData[10] = scene.biomeColorsEnabled() ? 1.0f : 0.0f;
-        // Pre-compute cloud grid offsets: gridX = worldX * inv_size + cloudOffsetX
-        // CPU uses: gridX = (gpuX + origin.x) / cloudSize + cloudXOffset
-        //         = gpuX / cloudSize + (origin.x / cloudSize + cloudXOffset)
         renderData[11] = (float) (scene.getOrigin().x / cloudSize + scene.sky().cloudXOffset());
         renderData[12] = (float) (scene.getOrigin().z / cloudSize + scene.sky().cloudZOffset());
+        // Y-clipping bounds (octree-local): used by fog sky ray endpoints.
+        // In octree-local space, Y range is always [0, octreeSize].
+        int octreeSize = 1 << scene.getWorldOctree().getDepth();
+        renderData[13] = 0.0f;
+        renderData[14] = (float) octreeSize;
+        renderData[15] = (float) biomeYLevels;
 
         if (!Arrays.equals(renderData, prevRenderData)) {
             prevRenderData = renderData;
@@ -407,16 +412,13 @@ public class ClSceneLoader extends AbstractSceneLoader {
         if (biomeDataBuffer != null) return;
 
         if (!scene.biomeColorsEnabled()) {
-            // No biome colors: create a small placeholder buffer
             biomeDataSize = 0;
+            biomeYLevels = 1;
             biomeDataBuffer = new ClIntBuffer(new int[] {0}, context);
             return;
         }
 
-        // Scene's biome textures (grassTexture, foliageTexture, etc.) are null until
-        // loadChunks() has run. The get*Color() methods will NPE if called too early.
-        // Test with getGrassColor — if it throws, biome data isn't ready yet; skip and
-        // let the next call retry (biomeDataBuffer is still null so we'll try again).
+        // Scene's biome textures are null until loadChunks() has run.
         try {
             scene.getGrassColor(0, 0, 0);
         } catch (NullPointerException e) {
@@ -424,30 +426,42 @@ public class ClSceneLoader extends AbstractSceneLoader {
         }
 
         int octreeSize = 1 << scene.getWorldOctree().getDepth();
-        // Cap export size to avoid excessive memory (2048^2 * 4 ints * 4 bytes = 64MB)
         if (octreeSize > 2048) {
             biomeDataSize = 0;
+            biomeYLevels = 1;
             biomeDataBuffer = new ClIntBuffer(new int[] {0}, context);
             return;
         }
 
+        // Compute Y levels at stride-16 (one per chunk section).
+        // Memory cap: 64MB = 16M ints.  If 3D would exceed that, fall back to 2D.
+        // In octree-local space, height = octreeSize (power of 2 cube)
+        int octreeHeight = octreeSize;
+        int yLevels = Math.max(1, (octreeHeight + 15) / 16);
+        long totalInts = (long) octreeSize * yLevels * octreeSize * 4;
+        if (totalInts > 16_000_000L) {
+            // Too large for 3D, fall back to 2D (yLevels = 1)
+            yLevels = 1;
+        }
+
         biomeDataSize = octreeSize;
-        // Layout: 4 ints per (x,z) position: [grass, foliage, water, dryFoliage] as packed linear ARGB
-        // Only iterate loaded chunks (typically far fewer than octreeSize²) and fill
-        // the rest with a default biome color to avoid the massive O(octreeSize²) loop.
+        biomeYLevels = yLevels;
+
+        // Layout: 4 ints per (yLevel, x, z): [grass, foliage, water, dryFoliage]
+        // Index: (yLevel * octreeSize * octreeSize + z * octreeSize + x) * 4
+        int arraySize = octreeSize * yLevels * octreeSize * 4;
         int defaultBiome = packLinearRgb(scene.getGrassColor(0, 0, 0));
         int defaultFoliage = packLinearRgb(scene.getFoliageColor(0, 0, 0));
         int defaultWater = packLinearRgb(scene.getWaterColor(0, 0, 0));
         int defaultDryFoliage = packLinearRgb(scene.getDryFoliageColor(0, 0, 0));
-        int[] biomeData = new int[octreeSize * octreeSize * 4];
-        // Fill with defaults
+        int[] biomeData = new int[arraySize];
         for (int i = 0; i < biomeData.length; i += 4) {
             biomeData[i]     = defaultBiome;
             biomeData[i + 1] = defaultFoliage;
             biomeData[i + 2] = defaultWater;
             biomeData[i + 3] = defaultDryFoliage;
         }
-        // Only query biome colors for positions inside loaded chunks
+
         Vector3i origin = scene.getOrigin();
         for (ChunkPosition cp : scene.getChunks()) {
             int localBlockX = cp.x * 16 - origin.x;
@@ -458,15 +472,19 @@ public class ClSceneLoader extends AbstractSceneLoader {
                 for (int dx = 0; dx < 16; dx++) {
                     int x = localBlockX + dx;
                     if (x < 0 || x >= octreeSize) continue;
-                    int base = (z * octreeSize + x) * 4;
-                    float[] grass = scene.getGrassColor(x, 0, z);
-                    float[] foliage = scene.getFoliageColor(x, 0, z);
-                    float[] water = scene.getWaterColor(x, 0, z);
-                    float[] dryFoliage = scene.getDryFoliageColor(x, 0, z);
-                    biomeData[base]     = packLinearRgb(grass);
-                    biomeData[base + 1] = packLinearRgb(foliage);
-                    biomeData[base + 2] = packLinearRgb(water);
-                    biomeData[base + 3] = packLinearRgb(dryFoliage);
+                    for (int yl = 0; yl < yLevels; yl++) {
+                        // Sample at center of each chunk section
+                        int y = yl * 16 + 8;
+                        int base = (yl * octreeSize * octreeSize + z * octreeSize + x) * 4;
+                        float[] grass = scene.getGrassColor(x, y, z);
+                        float[] foliage = scene.getFoliageColor(x, y, z);
+                        float[] water = scene.getWaterColor(x, y, z);
+                        float[] dryFoliage = scene.getDryFoliageColor(x, y, z);
+                        biomeData[base]     = packLinearRgb(grass);
+                        biomeData[base + 1] = packLinearRgb(foliage);
+                        biomeData[base + 2] = packLinearRgb(water);
+                        biomeData[base + 3] = packLinearRgb(dryFoliage);
+                    }
                 }
             }
         }
@@ -693,6 +711,10 @@ public class ClSceneLoader extends AbstractSceneLoader {
 
     public int getBiomeDataSize() {
         return biomeDataSize;
+    }
+
+    public int getBiomeYLevels() {
+        return biomeYLevels;
     }
 
     public int getResetGeneration() {

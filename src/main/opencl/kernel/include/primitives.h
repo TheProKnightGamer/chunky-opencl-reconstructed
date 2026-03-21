@@ -101,24 +101,19 @@ bool AABB_full_intersect(AABB self, Ray ray, IntersectionRecord* record) {
     if (t1s.x == tmin) {
         record->texCoord = (float2) (1 - (o.z - self.zmin) * d.z, (o.y - self.ymin) * d.y);
         record->normal = (float3) (-1, 0, 0);
-    }
-    if (t2s.x == tmin) {
+    } else if (t2s.x == tmin) {
         record->texCoord = (float2) ((o.z - self.zmin) * d.z, (o.y - self.ymin) * d.y);
         record->normal = (float3) (1, 0, 0);
-    }
-    if (t1s.y == tmin) {
+    } else if (t1s.y == tmin) {
         record->texCoord = (float2) ((o.x - self.xmin) * d.x, 1 - (o.z - self.zmin) * d.z);
         record->normal = (float3) (0, -1, 0);
-    }
-    if (t2s.y == tmin) {
+    } else if (t2s.y == tmin) {
         record->texCoord = (float2) ((o.x - self.xmin) * d.x, (o.z - self.zmin) * d.z);
         record->normal = (float3) (0, 1, 0);
-    }
-    if (t1s.z == tmin) {
+    } else if (t1s.z == tmin) {
         record->texCoord = (float2) ((o.x - self.xmin) * d.x, (o.y - self.ymin) * d.y);
         record->normal = (float3) (0, 0, -1);
-    }
-    if (t2s.z == tmin) {
+    } else {
         record->texCoord = (float2) (1 - (o.x - self.xmin) * d.x, (o.y - self.ymin) * d.y);
         record->normal = (float3) (0, 0, 1);
     }
@@ -157,24 +152,19 @@ bool AABB_full_intersect_map_2(AABB self, Ray ray, IntersectionRecord* record) {
     if (t1s.x == tmin) {
         record->texCoord = (float2) (o.z, o.y);
         record->normal = (float3) (-1, 0, 0);
-    }
-    if (t2s.x == tmin) {
+    } else if (t2s.x == tmin) {
         record->texCoord = (float2) (1 - o.z, o.y);
         record->normal = (float3) (1, 0, 0);
-    }
-    if (t1s.y == tmin) {
+    } else if (t1s.y == tmin) {
         record->texCoord = (float2) (o.x, o.z);
         record->normal = (float3) (0, -1, 0);
-    }
-    if (t2s.y == tmin) {
+    } else if (t2s.y == tmin) {
         record->texCoord = (float2) (o.x, 1 - o.z);
         record->normal = (float3) (0, 1, 0);
-    }
-    if (t1s.z == tmin) {
+    } else if (t1s.z == tmin) {
         record->texCoord = (float2) (1 - o.x, o.y);
         record->normal = (float3) (0, 0, -1);
-    }
-    if (t2s.z == tmin) {
+    } else {
         record->texCoord = (float2) (o.x, o.y);
         record->normal = (float3) (0, 0, 1);
     }
@@ -230,24 +220,19 @@ bool TexturedAABB_intersect(TexturedAABB self, image2d_array_t atlas, MaterialPa
     if (tempRecord.normal.z == -1) {
         tempRecord.material = self.mn;
         flags = self.flags;
-    }
-    if (tempRecord.normal.x == 1) {
+    } else if (tempRecord.normal.x == 1) {
         tempRecord.material = self.me;
         flags = self.flags >> 4;
-    }
-    if (tempRecord.normal.z == 1) {
+    } else if (tempRecord.normal.z == 1) {
         tempRecord.material = self.ms;
         flags = self.flags >> 8;
-    }
-    if (tempRecord.normal.x == -1) {
+    } else if (tempRecord.normal.x == -1) {
         tempRecord.material = self.mw;
         flags = self.flags >> 12;
-    }
-    if (tempRecord.normal.y == 1) {
+    } else if (tempRecord.normal.y == 1) {
         tempRecord.material = self.mt;
         flags = self.flags >> 16;
-    }
-    if (tempRecord.normal.y == -1) {
+    } else if (tempRecord.normal.y == -1) {
         tempRecord.material = self.mb;
         flags = self.flags >> 20;
     }
@@ -274,6 +259,7 @@ bool TexturedAABB_intersect(TexturedAABB self, image2d_array_t atlas, MaterialPa
 
     Material material = Material_get(materialPalette, tempRecord.material);
     if (Material_sample(material, atlas, tempRecord.texCoord, sample)) {
+        tempRecord.blockData = 0;  // AABB models are not octree blocks
         *record = tempRecord;
         return true;
     } else {
@@ -338,6 +324,7 @@ bool Quad_intersect(Quad self, image2d_array_t atlas, MaterialPalette materialPa
                     record->normal = (doubleSided && denom > 0) ? -n : n;
                     record->distance = t;
                     record->material = self.material;
+                    record->blockData = 0;  // Quad models are not octree blocks
                     return true;
                 }
             }
@@ -435,6 +422,7 @@ bool Triangle_intersect(Triangle self, image2d_array_t atlas, MaterialPalette ma
             record->texCoord = texCoord;
             record->normal = self.n;
             record->material = self.material;
+            record->blockData = 0;  // BVH entities are not octree blocks
             record->distance = t;
             return true;
         }

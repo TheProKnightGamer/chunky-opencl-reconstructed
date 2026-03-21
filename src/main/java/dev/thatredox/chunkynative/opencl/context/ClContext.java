@@ -117,7 +117,7 @@ public class ClContext {
         Arrays.setAll(includePrograms, i -> headerPrograms.get(includeNames[i]));
 
         CL.setExceptionsEnabled(false);
-        int code = clCompileProgram(kernelProgram, 1, deviceArray, "-cl-std=CL1.2 -Werror",
+        int code = clCompileProgram(kernelProgram, 1, deviceArray, "-cl-std=CL1.2 -Werror -cl-mad-enable -cl-no-signed-zeros",
                 includePrograms.length, includePrograms, includeNames, null, null);
         if (code != CL_SUCCESS) {
             String error;

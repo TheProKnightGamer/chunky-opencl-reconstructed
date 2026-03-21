@@ -24,7 +24,7 @@ bool Bvh_intersect(Bvh self, image2d_array_t atlas, MaterialPalette palette, Ray
     
     int toVisit = 0;
     int currentNode = 0;
-    int nodesToVisit[64];
+    int nodesToVisit[32];
     int node[7];
     AABB box;
     // Guard against NaN in invDir: if direction component is zero, use large
@@ -79,10 +79,10 @@ bool Bvh_intersect(Bvh self, image2d_array_t atlas, MaterialPalette palette, Ray
             } else if (isnan(t2) || t2 > record->distance) {
                 currentNode += 7;
             } else if (t1 < t2) {
-                if (toVisit < 63) { nodesToVisit[toVisit++] = offset; }
+                if (toVisit < 31) { nodesToVisit[toVisit++] = offset; }
                 currentNode += 7;
             } else {
-                if (toVisit < 63) { nodesToVisit[toVisit++] = currentNode + 7; }
+                if (toVisit < 31) { nodesToVisit[toVisit++] = currentNode + 7; }
                 currentNode = offset;
             }
         }

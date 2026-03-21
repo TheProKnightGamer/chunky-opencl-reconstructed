@@ -209,7 +209,7 @@ bool Octree_exitWater(Octree self, image2d_array_t atlas, BlockPalette palette, 
             sample->refractive = true;
             sample->sss = false;
             sample->isWater = true;
-            sample->tintType = 0;
+            sample->tintType = 3;  // water biome tint (applied by applyBiomeTint)
             return true;
         }
 
