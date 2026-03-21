@@ -139,13 +139,14 @@ bool BlockPalette_intersectNormalizedBlock(BlockPalette self, image2d_array_t at
             return hit;
         }
         case 4: {
-            // Light block - only visible in preview mode (as a placeholder).
-            // During path tracing, light blocks are invisible as geometry;
-            // they contribute illumination via emitter sampling only.
-            if (!(ray.flags & RAY_PREVIEW)) {
-                return false;
-            }
-            AABB box = AABB_new(0, 1, 0, 1, 0, 1);
+            // Light block - invisible emitter in path tracing, visible in preview.
+            // Intersects as a small inset cube (0.125-0.875) matching CPU LightBlockModel.
+            // In path tracing: alpha is forced to 0 so Material_samplePdf always chooses
+            // doTransmit (pDiffuse=0), making the ray pass straight through with
+            // spectrum=(1,1,1). The block is invisible, but self-emission still fires
+            // at the hit point because it uses sample.color.xyz (ignoring alpha).
+            // In preview: alpha stays at 1 so the block is visible with placeholder texture.
+            AABB box = AABB_new(0.125f, 0.875f, 0.125f, 0.875f, 0.125f, 0.875f);
             hit = AABB_full_intersect(box, tempRay, &tempRecord);
             tempRecord.material = modelPointer;
             if (hit) {
@@ -158,6 +159,9 @@ bool BlockPalette_intersectNormalizedBlock(BlockPalette self, image2d_array_t at
                 Material material = Material_get(materialPalette, tempRecord.material);
                 hit = Material_sample(material, atlas, tempRecord.texCoord, sample);
                 if (hit) {
+                    if (!(ray.flags & RAY_PREVIEW)) {
+                        sample->color.w = 0.0f;
+                    }
                     *record = tempRecord;
                     return true;
                 }
