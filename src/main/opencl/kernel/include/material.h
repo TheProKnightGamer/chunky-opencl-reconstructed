@@ -96,9 +96,13 @@ bool Material_sample(Material self, image2d_array_t atlas, float2 uv, MaterialSa
         color = colorFromArgb(self.color);
 
     if (self.tint == 0xFE000000) {
-        // Light block
-        sample->color.xyz = 0.5f;
-        sample->color.w = 1.0f;
+        // Light block: use texture color for preview, white fallback for path tracing
+        // (CPU LightBlock uses white (1,1,1,1) as base color with emittance from level)
+        if (color.w > EPS) {
+            sample->color = color;
+        } else {
+            sample->color = (float4)(1.0f, 1.0f, 1.0f, 1.0f);
+        }
     } else if (color.w > EPS) {
         sample->color = color;
     } else {
@@ -139,7 +143,10 @@ bool Material_sample(Material self, image2d_array_t atlas, float2 uv, MaterialSa
     if (self.flags & 0b010)
         sample->emittance = Atlas_read_uv(uv.x, uv.y, self.normal_emittance, self.textureSize, atlas).w;
     else
-        sample->emittance = (self.normal_emittance & 0xFF) / 255.0f;
+        // When no texture, the full 32-bit word is (int)(emittance * 255).
+        // Light blocks can have emittance > 1.0 (up to 4.0 for level 15),
+        // so use the full int value instead of masking to 8 bits.
+        sample->emittance = (float)self.normal_emittance / 255.0f;
 
     // specular, metalness, roughness
     if (self.flags & 0b001) {
@@ -477,16 +484,11 @@ MaterialPdfSample Material_samplePdf(Material self, IntersectionRecord record, M
     bool doRefract = false;
     bool doTransmit = false;  // Non-refractive transparent pass-through
     if (sample.refractive || sample.isWater) {
-        bool isTranslucent = alpha < 1.0f - EPS;
-
-        if (isTranslucent) {
-            // For translucent materials (alpha < 1), probabilistically choose between
-            // diffuse reflection and transmission/refraction based on pDiffuse.
-            doRefract = (Random_nextFloat(random) >= pDiffuse);
-        } else {
-            // Fully opaque refractive material (glass, water plane): always refract
-            doRefract = true;
-        }
+        // Match CPU PathTracer: pDiffuse check applies to ALL refractive materials,
+        // regardless of alpha. For opaque texels (alpha≈1), pDiffuse≈1 → diffuse
+        // reflection (visible surface). For transparent texels (alpha≈0), pDiffuse≈0
+        // → refraction (invisible pass-through with Snell's law bending).
+        doRefract = (Random_nextFloat(random) >= pDiffuse);
     } else if (alpha < 1.0f - EPS) {
         // Non-refractive transparent blocks (e.g. glass, leaves, etc.):
         // probabilistically pass the ray straight through without refraction.
@@ -509,7 +511,9 @@ MaterialPdfSample Material_samplePdf(Material self, IntersectionRecord record, M
     }
 
     if (doRefract) {
-        // Transmission/refraction path
+        // Transmission/refraction path.
+        // When n1 == n2 (e.g., inside glass hitting exit face), target is AIR_IOR
+        // because the ray is leaving the material.
         float targetIor = (n1 != n2) ? n2 : AIR_IOR;
         if (n1 != targetIor) {
             // Fresnel refraction
@@ -526,20 +530,22 @@ MaterialPdfSample Material_samplePdf(Material self, IntersectionRecord record, M
                 float3 refractedDir;
                 if (_Material_refract(ray.direction, record.normal, n1n2, &refractedDir)) {
                     out.direction = refractedDir;
-                    // Apply fancy translucency spectrum for refraction
-                    if (fancierTranslucency) {
-                        out.spectrum = _Material_fancyTransmissionSpectrum(sample.color, pAbsorb, transmissivityCap);
-                    } else {
-                        // Old method: blend color with (1-absorption)
+                    // Fancy translucency breaks at alpha=1 (shouldTrans=0 → black).
+                    // Use the normal formula for opaque refractive (spectrum = color),
+                    // and fancy only for semi-transparent (stained glass, alpha<1).
+                    if (!fancierTranslucency || alpha >= 1.0f - EPS) {
                         float3 rgbTrans = (float3)(1.0f - pAbsorb);
                         rgbTrans = rgbTrans + sample.color.xyz * pAbsorb;
                         out.spectrum = rgbTrans;
+                    } else {
+                        out.spectrum = _Material_fancyTransmissionSpectrum(sample.color, pAbsorb, transmissivityCap);
                     }
                     out.specular = true;
                     out.transmitted = true;
                     out.newIor = targetIor;
                     return out;
                 } else {
+                    // Total internal reflection
                     out.direction = _Material_specularReflection(record, sample, ray, random);
                     out.spectrum = (float3)(1.0f);
                     out.specular = true;
@@ -547,15 +553,14 @@ MaterialPdfSample Material_samplePdf(Material self, IntersectionRecord record, M
                 }
             }
         } else {
-            // n1 == targetIor: already in the same medium, pass through
+            // n1 == targetIor: already in the target medium, pass through
             out.direction = ray.direction;
-            // Apply fancy translucency spectrum for transmission
-            if (fancierTranslucency) {
-                out.spectrum = _Material_fancyTransmissionSpectrum(sample.color, pAbsorb, transmissivityCap);
-            } else {
+            if (!fancierTranslucency || alpha >= 1.0f - EPS) {
                 float3 rgbTrans = (float3)(1.0f - pAbsorb);
                 rgbTrans = rgbTrans + sample.color.xyz * pAbsorb;
                 out.spectrum = rgbTrans;
+            } else {
+                out.spectrum = _Material_fancyTransmissionSpectrum(sample.color, pAbsorb, transmissivityCap);
             }
             out.specular = false;
             out.transmitted = true;

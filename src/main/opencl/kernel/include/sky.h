@@ -14,6 +14,7 @@ typedef struct {
     float intensity;
     float luminosity;
     float radius;
+    float radiusCos;        // precomputed cos(radius)
     float apparentBrightness;
     int modifySunTexture;
     float3 su;
@@ -39,7 +40,8 @@ Sun Sun_new(__global const int* data) {
     sun.modifySunTexture = data[11];
     sun.importanceSampleChance = as_float(data[12]);
     sun.importanceSampleRadius = as_float(data[13]);
-    
+    sun.radiusCos = cos(sun.radius);
+
     float phi = as_float(data[4]);
     float theta = as_float(data[5]);
     float r = fabs(cos(phi));
@@ -126,12 +128,10 @@ bool Sun_sampleDirection(Sun self, Ray* ray, Random random) {
         return false;
     }
 
-    float radius_cos = cos(self.radius);
-
     float x1 = Random_nextFloat(random);
     float x2 = Random_nextFloat(random);
 
-    float cos_a = 1 - x1 + x1 * radius_cos;
+    float cos_a = 1 - x1 + x1 * self.radiusCos;
     float sin_a = sqrt(1 - cos_a * cos_a);
     float phi = 2 * M_PI_F * x2;
 

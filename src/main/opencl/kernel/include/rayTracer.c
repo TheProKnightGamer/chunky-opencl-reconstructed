@@ -55,43 +55,59 @@ bool isInWater(SceneConfig scene, float3 origin) {
 #define SUN_SAMPLING_IMPORTANCE  3
 #define SUN_SAMPLING_HIGH_QUALITY 4
 
-Ray ray_to_camera(
+// Cached camera constants (populated once per work-item from global memory)
+typedef struct {
+    int projType;
+    int width;
+    float halfWidth, invHeight;
+    int cropX, cropY;
+    float shiftX, shiftY;
+    float3 cameraPos, m1s, m2s, m3s;
+} CameraCache;
+
+CameraCache CameraCache_load(
         const __global int* projectorType,
+        const __global float* cameraSettings,
+        const __global int* canvasConfig
+) {
+    CameraCache cc;
+    cc.projType = *projectorType;
+    if (cc.projType != -1) {
+        cc.cameraPos = vload3(0, cameraSettings);
+        cc.m1s = vload3(1, cameraSettings);
+        cc.m2s = vload3(2, cameraSettings);
+        cc.m3s = vload3(3, cameraSettings);
+        cc.width = canvasConfig[0];
+        int fullWidth = canvasConfig[2];
+        int fullHeight = canvasConfig[3];
+        cc.cropX = canvasConfig[4];
+        cc.cropY = canvasConfig[5];
+        cc.halfWidth = fullWidth / (2.0f * fullHeight);
+        cc.invHeight = 1.0f / fullHeight;
+        cc.shiftX = cameraSettings[12];
+        cc.shiftY = cameraSettings[13];
+    }
+    return cc;
+}
+
+Ray ray_to_camera(
+        CameraCache cc,
         const __global float* cameraSettings,
         const __global int* apertureMask,
         int apertureMaskWidth,
-        const __global int* canvasConfig,
         int gid,
         Random random
 ) {
     Ray ray;
-    if (*projectorType != -1) {
-        float3 cameraPos = vload3(0, cameraSettings);
-        float3 m1s = vload3(1, cameraSettings);
-        float3 m2s = vload3(2, cameraSettings);
-        float3 m3s = vload3(3, cameraSettings);
-
-        int width = canvasConfig[0];
-        int height = canvasConfig[1];
-        int fullWidth = canvasConfig[2];
-        int fullHeight = canvasConfig[3];
-        int cropX = canvasConfig[4];
-        int cropY = canvasConfig[5];
-
-        float halfWidth = fullWidth / (2.0f * fullHeight);
-        float invHeight = 1.0f / fullHeight;
-        float x = -halfWidth + ((gid % width) + Random_nextFloat(random) + cropX) * invHeight;
-        float y = -0.5f + ((gid / width) + Random_nextFloat(random) + cropY) * invHeight;
-
-        // Camera shift (lens shift / image plane offset) at positions [12] and [13]
-        float shiftX = cameraSettings[12];
-        float shiftY = cameraSettings[13];
-        x += shiftX;
-        y -= shiftY;
+    if (cc.projType != -1) {
+        float x = -cc.halfWidth + ((gid % cc.width) + Random_nextFloat(random) + cc.cropX) * cc.invHeight;
+        float y = -0.5f + ((gid / cc.width) + Random_nextFloat(random) + cc.cropY) * cc.invHeight;
+        x += cc.shiftX;
+        y -= cc.shiftY;
 
         __global const float* projSettings = cameraSettings + 14;
 
-        switch (*projectorType) {
+        switch (cc.projType) {
             case 0:
                 ray = Camera_pinHole(x, y, random, projSettings, apertureMask, apertureMaskWidth);
                 break;
@@ -122,17 +138,17 @@ Ray ray_to_camera(
         }
 
         ray.direction = normalize((float3) (
-                dot(m1s, ray.direction),
-                        dot(m2s, ray.direction),
-                        dot(m3s, ray.direction)
+                dot(cc.m1s, ray.direction),
+                        dot(cc.m2s, ray.direction),
+                        dot(cc.m3s, ray.direction)
         ));
         ray.origin = (float3) (
-                dot(m1s, ray.origin),
-                        dot(m2s, ray.origin),
-                        dot(m3s, ray.origin)
+                dot(cc.m1s, ray.origin),
+                        dot(cc.m2s, ray.origin),
+                        dot(cc.m3s, ray.origin)
         );
 
-        ray.origin += cameraPos;
+        ray.origin += cc.cameraPos;
     } else {
         ray = Camera_preGenerated(cameraSettings, gid);
     }
@@ -159,6 +175,17 @@ float3 getDirectLightAttenuation(
     shadow.inWater = isInWater(scene, origin);
     if (shadow.inWater) {
         shadow.currentIor = scene.waterIor;
+        // Set material to the water block data so the world octree skips internal
+        // water blocks. Without this, the shadow ray hits every water block boundary
+        // (full AABB faces), toggling inWater on each hit and never reaching the
+        // actual water surface — resulting in almost no water fog attenuation.
+        int wx = (int)floor(origin.x);
+        int wy = (int)floor(origin.y);
+        int wz = (int)floor(origin.z);
+        int wBlock = Octree_get(&scene.waterOctree, wx, wy, wz);
+        if (wBlock > 0) {
+            shadow.material = wBlock;
+        }
     }
 
     for (int i = 0; i < 8; i++) {
@@ -329,7 +356,8 @@ __kernel void render(
     // Load render config: [sunSamplingStrategy, transparentSky, branchCount,
     //                       cloudsEnabled, cloudHeight, cloudSize,
     //                       preventNormalEmitterWithSampling, strictDirectLight,
-    //                       fancierTranslucency, transmissivityCap, biomeColorsEnabled]
+    //                       fancierTranslucency, transmissivityCap, biomeColorsEnabled,
+    //                       cloudOffsetX, cloudOffsetZ, yMin, yMax, biomeYLevels]
     int sunSamplingStrategy = (int)renderConfig[0];
     scene.transparentSky = (renderConfig[1] > 0.5f);
     // branchCount is passed via dynamicConfig[4] so it updates per-frame (ramp-up logic)
@@ -348,6 +376,9 @@ __kernel void render(
     scene.biomeColorsEnabled = (renderConfig[10] > 0.5f);
     scene.biomeData = biomeData;
     scene.biomeDataSize = biomeDataSize;
+    scene.biomeYLevels = max(1, (int)renderConfig[15]);
+    scene.yMin = renderConfig[13];
+    scene.yMax = renderConfig[14];
     scene.chunkBitmap = chunkBitmap;
     scene.chunkBitmapSize = chunkBitmapSize;
 
@@ -356,15 +387,39 @@ __kernel void render(
 
     Sun sun = Sun_new(sunData);
 
+    // Cache frequently-read global memory values (constant during dispatch)
+    unsigned int randSeed = dynamicConfig[0];
+    bool emittersEnabled = dynamicConfig[2] != 0;
+    int samplingStrategy = dynamicConfig[3];
+    float cachedEmitterIntensity = *emitterIntensity;
+    int cachedRayDepth = *rayDepth;
+    float cachedSkyIntensity = *skyIntensity;
+    float cachedSunPower = pow(sun.intensity, DEFAULT_GAMMA);
+    float cachedSunLumInv = (sun.luminosity > 0.0f) ? (1.0f / sun.luminosity) : 1.0f;
+    int gc_cellSize = 0, gc_offsetX = 0, gc_sizeX = 0;
+    int gc_offsetY = 0, gc_sizeY = 0, gc_offsetZ = 0, gc_sizeZ = 0;
+    if (emittersEnabled && samplingStrategy != 0 && gridConfig[2] > 0) {
+        gc_cellSize = gridConfig[0];
+        gc_offsetX = gridConfig[1];
+        gc_sizeX = gridConfig[2];
+        gc_offsetY = gridConfig[3];
+        gc_sizeY = gridConfig[4];
+        gc_offsetZ = gridConfig[5];
+        gc_sizeZ = gridConfig[6];
+    }
+
     float3 sumColor = (float3)(0.0f, 0.0f, 0.0f);
     float sumAlpha = 0.0f;
 
+    // Cache camera constants once (avoids re-reading global memory each iteration)
+    CameraCache camCache = CameraCache_load(projectorType, cameraSettings, canvasConfig);
+
     for (int it = 0; it < iterations; ++it) {
-        unsigned int randomState = dynamicConfig[0] + (unsigned int)(gid * 1664525u) + (unsigned int)(it * 1013904223u);
+        unsigned int randomState = randSeed + (unsigned int)(gid * 1664525u) + (unsigned int)(it * 1013904223u);
         Random random = &randomState;
         Random_nextState(random);
         Random_nextState(random);
-        Ray ray = ray_to_camera(projectorType, cameraSettings, apertureMask, apertureMaskWidth, canvasConfig, gid, random);
+        Ray ray = ray_to_camera(camCache, cameraSettings, apertureMask, apertureMaskWidth, gid, random);
 
         ray.material = 0;
         ray.flags = 0;
@@ -401,7 +456,7 @@ __kernel void render(
             MaterialSample skySample;
             bool diffuseSun = (sunSamplingStrategy == SUN_SAMPLING_OFF ||
                                sunSamplingStrategy == SUN_SAMPLING_IMPORTANCE);
-            intersectSky(skyTexture, *skyIntensity, sun, textureAtlas, ray, &skySample, diffuseSun);
+            intersectSky(skyTexture, cachedSkyIntensity, sun, textureAtlas, ray, &skySample, diffuseSun);
             color = skySample.emittance * skySample.color.xyz;
 
             // CPU: when camera is in water and ray doesn't hit anything,
@@ -416,7 +471,7 @@ __kernel void render(
                 float3 skyFogSunAtt = (float3)(0.0f);
                 float skyFogSunInt = 0.0f;
                 if (fogConfig.mode == FOG_MODE_LAYERED) {
-                    float skyScatterOff = Fog_sampleSkyScatterOffset(fogConfig, ray.origin, ray.direction, random);
+                    float skyScatterOff = Fog_sampleSkyScatterOffset(fogConfig, ray.origin, ray.direction, scene.yMin, scene.yMax, random);
                     float3 skyScatterPos = ray.origin + ray.direction * skyScatterOff;
                     skyFogSunAtt = getDirectLightAttenuation(scene, textureAtlas,
                         skyScatterPos, sun.sw, FOG_LIMIT, strictDirectLight);
@@ -425,6 +480,10 @@ __kernel void render(
                 Fog_addSkyFog(fogConfig, &color, ray.origin, ray.direction,
                               skyFogSunAtt, skyFogSunInt);
             }
+
+            // Sky path doesn't enter the branch loop, but avgColor divides by
+            // iterations*branchCount.  Scale up so the average is correct.
+            color *= (float)branchCount;
         } else {
             // First surface hit - branch count reuses this first intersection
             // Track first-hit air/water distance (shared across all branches).
@@ -460,7 +519,7 @@ __kernel void render(
                 MaterialSample sample = firstSample;
                 Material material = firstMaterial;
 
-                for (int depth = 0; depth < *rayDepth; depth++) {
+                for (int depth = 0; depth < cachedRayDepth; depth++) {
                     // For depth > 0, find next intersection
                     if (depth > 0) {
                         record = IntersectionRecord_new();
@@ -475,7 +534,7 @@ __kernel void render(
 
                             bool diffuseSun = (sunSamplingStrategy == SUN_SAMPLING_OFF ||
                                                sunSamplingStrategy == SUN_SAMPLING_IMPORTANCE);
-                            intersectSky(skyTexture, *skyIntensity, sun, textureAtlas, bRay, &sample, diffuseSun);
+                            intersectSky(skyTexture, cachedSkyIntensity, sun, textureAtlas, bRay, &sample, diffuseSun);
                             throughput *= sample.color.xyz;
                             branchColor += sample.emittance * throughput;
 
@@ -485,7 +544,7 @@ __kernel void render(
                                 float3 skyFogSunAtt2 = (float3)(0.0f);
                                 float skyFogSunInt2 = 0.0f;
                                 if (fogConfig.mode == FOG_MODE_LAYERED) {
-                                    float skyScatterOff2 = Fog_sampleSkyScatterOffset(fogConfig, bRay.origin, bRay.direction, random);
+                                    float skyScatterOff2 = Fog_sampleSkyScatterOffset(fogConfig, bRay.origin, bRay.direction, scene.yMin, scene.yMax, random);
                                     float3 skyScatterPos2 = bRay.origin + bRay.direction * skyScatterOff2;
                                     skyFogSunAtt2 = getDirectLightAttenuation(scene, textureAtlas,
                                         skyScatterPos2, sun.sw, FOG_LIMIT, strictDirectLight);
@@ -497,12 +556,6 @@ __kernel void render(
                             break;
                         }
 
-                        // Apply biome tinting at the hit point
-                        {
-                            float3 hitPos = bRay.origin + bRay.direction * record.distance;
-                            applyBiomeTint(scene, &sample, hitPos);
-                        }
-
                         // Track distance through air and water (for fog)
                         if (bRay.inWater) {
                             totalWaterDistance += record.distance;
@@ -511,9 +564,15 @@ __kernel void render(
                         }
                     }
 
+                    // Compute hit position once per bounce (reused for biome tint, emitter, sun)
+                    float3 hitPos = bRay.origin + bRay.direction * record.distance;
+
+                    // Apply biome tinting (depth > 0 only; depth 0 was already tinted)
+                    if (depth > 0) {
+                        applyBiomeTint(scene, &sample, hitPos);
+                    }
+
                     // Apply water fog attenuation (Beer's law, matching CPU).
-                    // CPU applies ray.color.scale(exp(-distance/waterVisibility)) after
-                    // each water segment. Pure absorption, no inscatter.
                     if (totalWaterDistance > 0.0f) {
                         float fogAtt = Water_fogAttenuation(totalWaterDistance, scene.waterVisibility);
                         throughput *= fogAtt;
@@ -544,35 +603,35 @@ __kernel void render(
                     }
 
                     // Emitter self-emission
-                    int samplingStrategy = dynamicConfig[3];
-                    if (dynamicConfig[2] && sample.emittance > EPS
+                    if (emittersEnabled && sample.emittance > EPS
                         && (!preventNormalEmitterWithSampling || samplingStrategy == 0 || depth == 0)) {
                         float3 emColor = (float3)(sample.color.x * sample.color.x,
                                                   sample.color.y * sample.color.y,
                                                   sample.color.z * sample.color.z);
-                        branchColor += emColor * sample.emittance * (*emitterIntensity) * prevThroughput;
+                        branchColor += emColor * sample.emittance * cachedEmitterIntensity * prevThroughput;
                     }
 
-                    // Emitter sampling via emitter grid
-                    if (dynamicConfig[2] && samplingStrategy != 0 && gridConfig[2] > 0) {
-                        int cellSize = gridConfig[0];
-                        int offsetX = gridConfig[1];
-                        int sizeX = gridConfig[2];
-                        int offsetY = gridConfig[3];
-                        int sizeY = gridConfig[4];
-                        int offsetZ = gridConfig[5];
-                        int sizeZ = gridConfig[6];
+                    // Emitter sampling via emitter grid (non-specular bounces only)
+                    if (emittersEnabled && samplingStrategy != 0 && gc_sizeX > 0
+                        && !pdfSample.specular) {
+                        int cellSize = gc_cellSize;
+                        int offsetX = gc_offsetX;
+                        int sizeX = gc_sizeX;
+                        int offsetY = gc_offsetY;
+                        int sizeY = gc_sizeY;
+                        int offsetZ = gc_offsetZ;
+                        int sizeZ = gc_sizeZ;
 
-                        int gx = (int)floor(bRay.origin.x) / cellSize;
-                        int gy = (int)floor(bRay.origin.y) / cellSize;
-                        int gz = (int)floor(bRay.origin.z) / cellSize;
+                        int gx = (int)floor(bRay.origin.x / (float)cellSize);
+                        int gy = (int)floor(bRay.origin.y / (float)cellSize);
+                        int gz = (int)floor(bRay.origin.z / (float)cellSize);
 
                         if (gx >= offsetX && gx < offsetX + sizeX && gy >= offsetY && gy < offsetY + sizeY && gz >= offsetZ && gz < offsetZ + sizeZ) {
                             int idx = (((gy - offsetY) * sizeX) + (gx - offsetX)) * sizeZ + (gz - offsetZ);
                             int eStart = constructedGrid[2*idx];
                             int eCount = constructedGrid[2*idx + 1];
                             if (eCount > 0) {
-                                float3 hitPoint = bRay.origin + bRay.direction * record.distance + record.normal * OFFSET;
+                                float3 hitPoint = hitPos + record.normal * OFFSET;
                                 if (samplingStrategy == 1) {
                                     // ONE: pick one random emitter, sample a random face point
                                     unsigned int r = Random_nextState(random);
@@ -603,16 +662,29 @@ __kernel void render(
                                         shadow.origin = hitPoint;
                                         shadow.direction = dirToEmitter;
                                         IntersectionRecord srec = IntersectionRecord_new();
+                                        srec.distance = dist;
                                         Material sSample;
                                         MaterialSample sMatSample;
-                                        if (!closestIntersect(scene, textureAtlas, shadow, &srec, &sMatSample, &sSample) || srec.distance >= dist - 1e-4f) {
+                                        bool shadowClear = !closestIntersect(scene, textureAtlas, shadow, &srec, &sMatSample, &sSample);
+                                        if (shadowClear || srec.distance >= dist - 1e-4f) {
+                                            if (shadowClear) {
+                                                // Emitter invisible to rays (light block): look up material from octree
+                                                int bd = Octree_get(&scene.octree, ex, ey, ez);
+                                                if (bd > 0) {
+                                                    Material em = Material_get(scene.materialPalette, scene.blockPalette.blockPalette[bd + 1]);
+                                                    Material_sample(em, textureAtlas, (float2)(ru, rv), &sMatSample);
+                                                }
+                                                srec.normal = (face < 2) ? (float3)(face == 0 ? -1.0f : 1.0f, 0, 0)
+                                                            : (face < 4) ? (float3)(0, face == 2 ? -1.0f : 1.0f, 0)
+                                                                         : (float3)(0, 0, face == 4 ? -1.0f : 1.0f);
+                                            }
                                             float cosEmitter = fabs(dot(dirToEmitter, srec.normal));
                                             float att = fmax(0.0f, dot(record.normal, dirToEmitter)) * cosEmitter / fmax(dist * dist, 1.0f);
-                                            att *= avgFaceArea;  // Correct for non-cube emitter surface area
+                                            att *= avgFaceArea;
                                             float3 emitterCol = (float3)(sMatSample.color.x * sMatSample.color.x * sMatSample.emittance,
                                                                         sMatSample.color.y * sMatSample.color.y * sMatSample.emittance,
                                                                         sMatSample.color.z * sMatSample.color.z * sMatSample.emittance);
-                                            branchColor += throughput * (*emitterIntensity) * emitterCol * att * (float)M_PI_F;
+                                            branchColor += throughput * cachedEmitterIntensity * emitterCol * att * (float)M_PI_F;
                                         }
                                     }
                                 } else if (samplingStrategy == 2) {
@@ -645,21 +717,33 @@ __kernel void render(
                                         shadow.origin = hitPoint;
                                         shadow.direction = dirToEmitter;
                                         IntersectionRecord srec = IntersectionRecord_new();
+                                        srec.distance = dist;
                                         Material sSample;
                                         MaterialSample sMatSample;
-                                        if (!closestIntersect(scene, textureAtlas, shadow, &srec, &sMatSample, &sSample) || srec.distance >= dist - 1e-4f) {
+                                        bool shadowClear = !closestIntersect(scene, textureAtlas, shadow, &srec, &sMatSample, &sSample);
+                                        if (shadowClear || srec.distance >= dist - 1e-4f) {
+                                            if (shadowClear) {
+                                                int bd = Octree_get(&scene.octree, ex, ey, ez);
+                                                if (bd > 0) {
+                                                    Material em = Material_get(scene.materialPalette, scene.blockPalette.blockPalette[bd + 1]);
+                                                    Material_sample(em, textureAtlas, (float2)(ru, rv), &sMatSample);
+                                                }
+                                                srec.normal = (face < 2) ? (float3)(face == 0 ? -1.0f : 1.0f, 0, 0)
+                                                            : (face < 4) ? (float3)(0, face == 2 ? -1.0f : 1.0f, 0)
+                                                                         : (float3)(0, 0, face == 4 ? -1.0f : 1.0f);
+                                            }
                                             float cosEmitter = fabs(dot(dirToEmitter, srec.normal));
                                             float att = fmax(0.0f, dot(record.normal, dirToEmitter)) * cosEmitter / fmax(dist * dist, 1.0f);
-                                            att *= avgFaceArea;  // Correct for non-cube emitter surface area
+                                            att *= avgFaceArea;
                                             float3 emitterCol = (float3)(sMatSample.color.x * sMatSample.color.x * sMatSample.emittance,
                                                                         sMatSample.color.y * sMatSample.color.y * sMatSample.emittance,
                                                                         sMatSample.color.z * sMatSample.color.z * sMatSample.emittance);
                                             accCol += emitterCol * att;
                                         }
                                     }
-                                    branchColor += throughput * (*emitterIntensity) * accCol * (1.0f / 6.0f) * (float)M_PI_F;
+                                    branchColor += throughput * cachedEmitterIntensity * accCol * (1.0f / 6.0f) * (float)M_PI_F;
                                 } else if (samplingStrategy == 3) {
-                                    // ALL: iterate every emitter in the grid cell, sample all 6 faces each
+                                    // ALL: iterate every emitter in the grid cell, sample all 6 faces each.
                                     float3 accCol = (float3)(0.0f, 0.0f, 0.0f);
                                     for (int si = 0; si < eCount; ++si) {
                                         int emitterIndex = positionIndexes[eStart + si];
@@ -687,12 +771,24 @@ __kernel void render(
                                             shadow.origin = hitPoint;
                                             shadow.direction = dirToEmitter;
                                             IntersectionRecord srec = IntersectionRecord_new();
+                                            srec.distance = dist;
                                             Material sSample;
                                             MaterialSample sMatSample;
-                                            if (!closestIntersect(scene, textureAtlas, shadow, &srec, &sMatSample, &sSample) || srec.distance >= dist - 1e-4f) {
+                                            bool shadowClear = !closestIntersect(scene, textureAtlas, shadow, &srec, &sMatSample, &sSample);
+                                            if (shadowClear || srec.distance >= dist - 1e-4f) {
+                                                if (shadowClear) {
+                                                    int bd = Octree_get(&scene.octree, ex, ey, ez);
+                                                    if (bd > 0) {
+                                                        Material em = Material_get(scene.materialPalette, scene.blockPalette.blockPalette[bd + 1]);
+                                                        Material_sample(em, textureAtlas, (float2)(ru, rv), &sMatSample);
+                                                    }
+                                                    srec.normal = (face < 2) ? (float3)(face == 0 ? -1.0f : 1.0f, 0, 0)
+                                                                : (face < 4) ? (float3)(0, face == 2 ? -1.0f : 1.0f, 0)
+                                                                             : (float3)(0, 0, face == 4 ? -1.0f : 1.0f);
+                                                }
                                                 float cosEmitter = fabs(dot(dirToEmitter, srec.normal));
                                                 float att = fmax(0.0f, dot(record.normal, dirToEmitter)) * cosEmitter / fmax(dist * dist, 1.0f);
-                                                att *= avgFaceArea;  // Correct for non-cube emitter surface area
+                                                att *= avgFaceArea;
                                                 float3 emitterCol = (float3)(sMatSample.color.x * sMatSample.color.x * sMatSample.emittance,
                                                                             sMatSample.color.y * sMatSample.color.y * sMatSample.emittance,
                                                                             sMatSample.color.z * sMatSample.color.z * sMatSample.emittance);
@@ -700,39 +796,37 @@ __kernel void render(
                                             }
                                         }
                                     }
-                                    if (eCount > 0) branchColor += throughput * (*emitterIntensity) * (accCol / (float)(eCount * 6)) * (float)M_PI_F;
+                                    if (eCount > 0) branchColor += throughput * cachedEmitterIntensity * (accCol / (float)(eCount * 6)) * (float)M_PI_F;
                                 }
                             }
                         }
                     }
 
-                    // Sun direct light sampling (on diffuse bounces)
+                    // Sun direct light sampling (on non-specular bounces)
                     if ((sunSamplingStrategy == SUN_SAMPLING_FAST || sunSamplingStrategy == SUN_SAMPLING_HIGH_QUALITY)
                         && !pdfSample.specular) {
-                        float3 baseHitPoint = bRay.origin + bRay.direction * record.distance;
                         Ray sunRay;
-                        sunRay.origin = baseHitPoint;
+                        sunRay.origin = hitPos;
                         if (Sun_sampleDirection(sun, &sunRay, random)) {
                             float cosSun = dot(record.normal, sunRay.direction);
                             bool frontLight = cosSun > 0.0f;
                             // CPU PathTracer: backside sun sampling for SSS materials (30% chance)
                             if (frontLight || (sample.sss && Random_nextFloat(random) < F_SUBSURFACE)) {
-                                float3 hitPoint;
+                                float3 sunHitPoint;
                                 if (frontLight) {
-                                    hitPoint = baseHitPoint + record.normal * OFFSET;
+                                    sunHitPoint = hitPos + record.normal * OFFSET;
                                 } else {
-                                    hitPoint = baseHitPoint - record.normal * OFFSET;
+                                    sunHitPoint = hitPos - record.normal * OFFSET;
                                 }
-                                sunRay.origin = hitPoint;
+                                sunRay.origin = sunHitPoint;
                                 float3 sunAtt = getDirectLightAttenuation(scene, textureAtlas,
-                                    hitPoint, sunRay.direction, FOG_LIMIT, strictDirectLight);
+                                    sunHitPoint, sunRay.direction, FOG_LIMIT, strictDirectLight);
                                 if (sunAtt.x + sunAtt.y + sunAtt.z > 0.0f) {
-                                    float sunPower = pow(sun.intensity, DEFAULT_GAMMA);
                                     float mult = fabs(cosSun);
                                     if (sunSamplingStrategy == SUN_SAMPLING_HIGH_QUALITY) {
-                                        mult *= (1.0f / sun.luminosity);
+                                        mult *= cachedSunLumInv;
                                     }
-                                    float3 sunContrib = sun.color.xyz * sunPower * mult * sunAtt;
+                                    float3 sunContrib = sun.color.xyz * cachedSunPower * mult * sunAtt;
                                     branchColor += prevThroughput * sample.color.xyz * sunContrib;
                                 }
                             }
@@ -841,6 +935,9 @@ __kernel void preview(
     __global const float* waterConfig,
     __global const int* chunkBitmap,
     int chunkBitmapSize,
+    __global const int* biomeData,
+    int biomeDataSize,
+    int biomeYLevels,
     __global int* res
 ) {
     int gid = get_global_id(0);
@@ -864,36 +961,20 @@ __kernel void preview(
     scene.blockPalette = BlockPalette_new(bPalette, quadModels, aabbModels, &scene.materialPalette);
     scene.drawDepth = 256;
 
-    // Load water config for preview
     scene.waterPlaneEnabled = (waterConfig[0] > 0.5f);
     scene.waterPlaneHeight = waterConfig[1];
     scene.waterPlaneChunkClip = (waterConfig[2] > 0.5f);
     scene.octreeSize = waterConfig[3];
-    scene.waterShadingStrategy = (int)waterConfig[4];
-    scene.animationTime = waterConfig[5];
-    scene.waterVisibility = waterConfig[6];
     scene.waterColor = (float3)(waterConfig[7], waterConfig[8], waterConfig[9]);
     scene.useCustomWaterColor = (waterConfig[10] > 0.5f);
     scene.waterIor = waterConfig[11];
-    scene.waterShaderParams.iterations = (int)waterConfig[12];
-    scene.waterShaderParams.baseFrequency = waterConfig[13];
-    scene.waterShaderParams.baseAmplitude = waterConfig[14];
-    scene.waterShaderParams.animationSpeed = waterConfig[15];
     scene.waterOpacity = waterConfig[16];
-    scene.waterNormalMap = NULL;
-    scene.waterNormalMapW = 0;
-    scene.cloudsEnabled = false;
-    scene.transparentSky = false;
-    scene.cloudHeight = 0;
-    scene.cloudSize = 128;
-    scene.cloudOffsetX = 0;
-    scene.cloudOffsetZ = 0;
-    scene.cloudData = NULL;
-    scene.biomeData = NULL;
-    scene.biomeDataSize = 0;
-    scene.biomeColorsEnabled = false;
     scene.chunkBitmap = chunkBitmap;
     scene.chunkBitmapSize = chunkBitmapSize;
+    scene.biomeColorsEnabled = (biomeDataSize > 0);
+    scene.biomeData = biomeData;
+    scene.biomeDataSize = biomeDataSize;
+    scene.biomeYLevels = max(1, biomeYLevels);
 
     Sun sun = Sun_new(sunData);
 
@@ -901,7 +982,8 @@ __kernel void preview(
     Random random = &randomState;
     Random_nextState(random);
 
-    Ray ray = ray_to_camera(projectorType, cameraSettings, NULL, 0, canvasConfig, gid, random);
+    CameraCache camCache = CameraCache_load(projectorType, cameraSettings, canvasConfig);
+    Ray ray = ray_to_camera(camCache, cameraSettings, NULL, 0, gid, random);
 
     IntersectionRecord record = IntersectionRecord_new();
     MaterialSample sample;
@@ -913,48 +995,80 @@ __kernel void preview(
     ray.prevIor = AIR_IOR;
     ray.inWater = false;
 
-    // Check if camera starts inside water for preview too
+    // Check if camera is underwater (matching CPU PreviewRayTracer initial medium setup)
     if (isInWater(scene, ray.origin)) {
         ray.inWater = true;
         ray.currentIor = scene.waterIor;
     }
 
-    float3 color;
+    float3 color = (float3)(0.0f);
     bool hitSolid = false;
-    // Transparency skip loop: matches CPU PreviewRayTracer behavior.
-    // CPU: stops when material != Air AND color.w > 0.
-    // The GPU Material_sample returns false for transparent texels of non-refractive
-    // blocks, so closestIntersect won't even register a hit there. For refractive
-    // blocks, transparent texels return true with color.w = 0 (to allow skip-through).
-    // We only skip past hits where color.w == 0 (purely transparent samples from
-    // refractive material edges). Max 8 iterations to prevent lag.
+
+    // Front-to-back alpha accumulators for semi-transparent layers (water, stained glass).
+    // C_out += (1 - alphaAccum) * layerAlpha * layerColor at each layer.
+    float3 tintAccum = (float3)(0.0f);
+    float alphaAccum = 0.0f;
+
+    // Transparency loop with alpha blending.  Fully transparent (alpha==0) hits are
+    // skipped, semi-transparent hits are composited as tint layers, opaque hits stop.
     for (int skipIter = 0; skipIter < 8; skipIter++) {
         record = IntersectionRecord_new();
-        if (!closestIntersect(scene, textureAtlas, ray, &record, &sample, &material)) {
+        if (!previewIntersect(scene, textureAtlas, ray, &record, &sample, &material)) {
             break;
         }
-        if (sample.color.w > EPS) {
-            // Solid hit (material is non-air and has opacity)
-            float3 previewHitPos = ray.origin + ray.direction * record.distance;
-            applyBiomeTint(scene, &sample, previewHitPos);
-            float shading = dot(record.normal, (float3)(0.25f, 0.866f, 0.433f));
-            shading = fmax(0.3f, shading);
-            color = sample.color.xyz * shading;
-            hitSolid = true;
-            break;
+
+        if (sample.color.w <= EPS) {
+            // Fully transparent: skip past
+            ray.origin = ray.origin + ray.direction * (record.distance + OFFSET);
+            ray.material = record.blockData;
+            // Toggle water state when passing through water surface
+            if (sample.isWater) ray.inWater = !ray.inWater;
+            continue;
         }
-        // Transparent hit (e.g. refractive material with alpha=0 texel): skip past
-        ray.origin = ray.origin + ray.direction * (record.distance + OFFSET);
-        // Track block data so octree skips the same block type (prevents
-        // re-intersecting from inside the block with a negative distance).
-        ray.material = record.blockData;
+
+        // Apply biome tint and flat shading
+        float3 previewHitPos = ray.origin + ray.direction * record.distance;
+        applyBiomeTint(scene, &sample, previewHitPos);
+        float shading = fmax(0.3f, dot(record.normal, sun.sw));
+        float3 hitColor = sample.color.xyz * shading;
+
+        if (sample.color.w < 1.0f - EPS) {
+            // Semi-transparent: accumulate as tint layer (front-to-back compositing)
+            float layerAlpha = sample.color.w;
+            float remaining = 1.0f - alphaAccum;
+            tintAccum += hitColor * layerAlpha * remaining;
+            alphaAccum += layerAlpha * remaining;
+
+            if (alphaAccum >= 0.99f) {
+                color = tintAccum;
+                hitSolid = true;
+                break;
+            }
+
+            ray.origin = ray.origin + ray.direction * (record.distance + OFFSET);
+            ray.material = record.blockData;
+            // Toggle water state when passing through water surface
+            if (sample.isWater) ray.inWater = !ray.inWater;
+            continue;
+        }
+
+        // Opaque hit
+        color = hitColor;
+        hitSolid = true;
+        break;
     }
+
+    // Composite accumulated semi-transparent layers over opaque background
+    if (alphaAccum > 0.0f && hitSolid) {
+        color = tintAccum + color * (1.0f - alphaAccum);
+    }
+
     if (!hitSolid) {
-        // Check for floor grid intersection (preview only).
-        // The CPU preview draws a chunk-boundary grid pattern at yMin (bottom of octree, Y=0 in local space).
+        // No opaque hit — resolve background (floor grid or sky)
+        float3 bgColor = (float3)(0.0f);
         bool gridHit = false;
         if (ray.direction.y < 0) {
-            float gridY = 0.0f; // yMin in octree-local space
+            float gridY = 0.0f;
             float gt = (gridY - ray.origin.y) / ray.direction.y;
             if (gt > OFFSET) {
                 float3 hitP = ray.origin + ray.direction * gt;
@@ -962,43 +1076,73 @@ __kernel void preview(
                 int octSize = 1 << (*octreeDepth);
                 bool insideOctree = (hitP.x >= 0 && hitP.x <= octSize &&
                                      hitP.z >= 0 && hitP.z <= octSize);
-                // Chunk grid pattern: 16-block chunks, 0.5-block line width centered at chunk boundaries
-                float xm = fmod(fmod(hitP.x, 16.0f) + 24.0f, 16.0f); // positive modulo + offset to center
+                float xm = fmod(fmod(hitP.x, 16.0f) + 24.0f, 16.0f);
                 float zm = fmod(fmod(hitP.z, 16.0f) + 24.0f, 16.0f);
-                float linePos = 7.75f;  // 8 - 0.5/2
-                float lineEnd = 8.25f;  // 8 + 0.5/2
+                float linePos = 7.75f;
+                float lineEnd = 8.25f;
                 bool isLine = (xm >= linePos && xm <= lineEnd) || (zm >= linePos && zm <= lineEnd);
                 if (isLine) {
-                    color = isSubmerged ? (float3)(0.05f, 0.05f, 0.25f) : (float3)(0.25f, 0.25f, 0.25f);
+                    bgColor = isSubmerged ? (float3)(0.05f, 0.05f, 0.25f) : (float3)(0.25f, 0.25f, 0.25f);
                 } else {
-                    color = isSubmerged ? (float3)(0.6f, 0.6f, 0.8f) : (float3)(0.8f, 0.8f, 0.8f);
+                    bgColor = isSubmerged ? (float3)(0.6f, 0.6f, 0.8f) : (float3)(0.8f, 0.8f, 0.8f);
                 }
                 if (insideOctree) {
-                    // Darken grid inside octree bounds (matches CPU chunkPatternInsideOctreeColorFactor)
-                    color *= 0.75f;
+                    bgColor *= 0.75f;
                 }
-                // Apply simple flat shading (sun direction approximation)
-                float gridShading = fmax(0.3f, (float3)(0.25f, 0.866f, 0.433f).y); // normal is (0,1,0)
-                color *= gridShading;
+                float gridShading = fmax(0.3f, sun.sw.y); // grid normal is (0,1,0)
+                bgColor *= gridShading;
                 gridHit = true;
             }
         }
         if (!gridHit) {
-            if (ray.inWater) {
-                // Underwater rays that escape without hitting geometry:
-                // show black (full absorption), matching CPU path tracer behavior.
-                // Single-precision float can lose the tiny direction.y component
-                // for near-horizontal rays, causing Water_planeIntersect and
-                // Octree_exitWater to miss the surface.
-                color = (float3)(0.0f, 0.0f, 0.0f);
-            } else {
-                intersectSky(skyTexture, *skyIntensity, sun, textureAtlas, ray, &sample, true);
-                color = sample.color.xyz;
-            }
+            intersectSky(skyTexture, *skyIntensity, sun, textureAtlas, ray, &sample, true);
+            bgColor = sample.color.xyz;
+        }
+
+        // Blend any accumulated semi-transparent layers over the background
+        if (alphaAccum > 0.0f) {
+            color = tintAccum + bgColor * (1.0f - alphaAccum);
+        } else {
+            color = bgColor;
         }
     }
 
     color = sqrt(color);
     int3 rgb = intFloorFloat3(clamp(color * 255.0f, 0.0f, 255.0f));
     res[gid] = 0xFF000000 | (rgb.x << 16) | (rgb.y << 8) | rgb.z;
+}
+
+// ---- 2D Map: nearest-neighbour upscale kernel ----
+// One work-item per destination pixel.
+// Replicates the CPU MapBuffer.drawBuffered() scaling logic on the GPU.
+__kernel void mapScale(
+    __global const int* src,   // source pixel buffer (chunk-scale)
+    __global int* dst,         // destination pixel buffer (screen-scale)
+    int srcWidth,
+    int srcHeight,
+    int dstWidth,
+    int dstHeight,
+    float scale,               // view.scale / view.chunkScale
+    int srcOffsetX,
+    int srcOffsetZ
+) {
+    int gid = get_global_id(0);
+    if (gid >= dstWidth * dstHeight) return;
+
+    int dstX = gid % dstWidth;
+    int dstY = gid / dstWidth;
+
+    // Map destination pixel back to source coordinates (nearest-neighbour)
+    int srcX = srcOffsetX + (int)(dstX / scale) + 1;
+    int srcY = srcOffsetZ + (int)(dstY / scale);
+
+    // Bounds check
+    int srcIdx = srcY * srcWidth + srcX;
+    if (srcX < 0 || srcX >= srcWidth || srcY < 0 || srcY >= srcHeight
+            || srcIdx < 0 || srcIdx >= srcWidth * srcHeight) {
+        dst[gid] = 0;
+        return;
+    }
+
+    dst[gid] = src[srcIdx];
 }

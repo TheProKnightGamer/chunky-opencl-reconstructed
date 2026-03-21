@@ -52,6 +52,7 @@ public abstract class SimpleGpuPostProcessingFilter implements PostProcessingFil
             clEnqueueReadBuffer(ctx.context.queue, outputMem.get(), CL_TRUE, 0,
                     (long) Sizeof.cl_int * output.data.length, Pointer.to(output.data),
                     1, new cl_event[] {event}, null);
+            clReleaseEvent(event);
         } finally {
             clReleaseKernel(kernel);
         }

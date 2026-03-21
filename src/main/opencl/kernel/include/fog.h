@@ -188,15 +188,13 @@ void Fog_addSkyFog(FogConfig fog, float3* color, float3 origin, float3 direction
 
 // Sample a scatter offset specifically for sky fog (layered mode only).
 // Matches CPU Fog.sampleSkyScatterOffset().
-float Fog_sampleSkyScatterOffset(FogConfig fog, float3 origin, float3 direction, Random random) {
+float Fog_sampleSkyScatterOffset(FogConfig fog, float3 origin, float3 direction,
+                                  float yMin, float yMax, Random random) {
     if (fog.mode != FOG_MODE_LAYERED || fog.numLayers <= 0) return EPS;
     float dy = direction.y;
     float y1 = origin.y;
     // CPU: y2 = dy > 0 ? scene.yMax : scene.yMin
-    // We approximate yMax/yMin with the octree boundary. For sky fog, FOG_LIMIT
-    // is used as a proxy since the exact scene bounds aren't available here.
-    // The scatter offset is a distance along the ray, not a y-coordinate.
-    float y2 = y1 + dy * FOG_LIMIT;
+    float y2 = (dy > 0.0f) ? yMax : yMin;
     return Fog_sampleLayeredScatterOffset(fog, y1, y2, dy, random);
 }
 

@@ -3,6 +3,7 @@ package dev.thatredox.chunkynative.opencl;
 import dev.thatredox.chunkynative.opencl.context.ContextManager;
 import dev.thatredox.chunkynative.opencl.renderer.OpenClPathTracingRenderer;
 import dev.thatredox.chunkynative.opencl.renderer.OpenClPreviewRenderer;
+import dev.thatredox.chunkynative.opencl.renderer.map.GpuMapRenderer;
 import dev.thatredox.chunkynative.opencl.tonemap.ChunkyImposterGpuPostProcessingFilter;
 import dev.thatredox.chunkynative.opencl.tonemap.UE4ToneMappingImposterGpuPostprocessingFilter;
 import dev.thatredox.chunkynative.opencl.ui.ChunkyClTab;
@@ -20,8 +21,12 @@ import se.llbit.chunky.ui.render.RenderControlsTab;
 import se.llbit.chunky.ui.render.RenderControlsTabTransformer;
 import se.llbit.log.Log;
 
+import javax.swing.*;
+import java.awt.*;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Timer;
+import java.util.TimerTask;
 
 /**
  * This plugin changes the Chunky path tracing renderer to a gpu based path tracer.
@@ -45,17 +50,11 @@ public class ChunkyCl implements Plugin {
             return;
         }
 
-        // Initialize OpenCL context and compile kernels before registering renderers.
-        // The first launch compiles from source (may take a few minutes) and caches
-        // the binary to disk. Subsequent launches load the cache near-instantly.
-        Log.info("ChunkyCL: Initializing OpenCL context and compiling kernels...");
-        try {
-            ContextManager.get();
-            Log.info("ChunkyCL: OpenCL context initialized successfully.");
-        } catch (Exception e) {
-            Log.error("Failed to initialize ChunkyCL OpenCL context.", e);
-            return;
-        }
+        // Compile OpenCL kernels before the UI launches.
+        // A Swing dialog with an indeterminate progress bar is shown while
+        // compilation runs on a background thread.  attach() blocks until
+        // the context is ready so the renderers never have to wait.
+        compileWithProgressDialog();
 
         Chunky.addRenderer(new OpenClPathTracingRenderer());
         Chunky.addPreviewRenderer(new OpenClPreviewRenderer());
@@ -114,6 +113,103 @@ public class ChunkyCl implements Plugin {
 
         PostProcessingFilters.getPostProcessingFilterFromId("UE4_FILMIC").ifPresent(filter ->
                 PostProcessingFilters.addPostProcessingFilter(new UE4ToneMappingImposterGpuPostprocessingFilter((UE4ToneMappingFilter) filter)));
+
+        // Install GPU-accelerated 2D map renderer (replaces CPU nearest-neighbour upscaling)
+        try {
+            GpuMapRenderer.install(chunky);
+        } catch (Exception e) {
+            Log.warn("ChunkyCL: Could not install GPU map renderer", e);
+        }
+    }
+
+    /**
+     * Show a Swing dialog with an indeterminate progress bar while OpenCL
+     * kernels compile.  Blocks the calling thread until compilation finishes.
+     * Swing is used because JavaFX has not been initialized at this point.
+     */
+    private void compileWithProgressDialog() {
+        final long startTime = System.currentTimeMillis();
+
+        // Kick off background compilation (sets up Timer-based logging too)
+        ContextManager.initAsync();
+
+        // Build the dialog on the Event Dispatch Thread
+        final JDialog[] dialogRef = new JDialog[1];
+        final JLabel[] elapsedLabel = new JLabel[1];
+        try {
+            SwingUtilities.invokeAndWait(() -> {
+                JDialog dialog = new JDialog((Frame) null, "ChunkyCL", false);
+                dialog.setDefaultCloseOperation(WindowConstants.DO_NOTHING_ON_CLOSE);
+
+                JPanel panel = new JPanel();
+                panel.setLayout(new BoxLayout(panel, BoxLayout.Y_AXIS));
+                panel.setBorder(BorderFactory.createEmptyBorder(15, 20, 15, 20));
+
+                JLabel title = new JLabel("Compiling OpenCL kernels\u2026");
+                title.setFont(title.getFont().deriveFont(Font.BOLD, 13f));
+                title.setAlignmentX(Component.LEFT_ALIGNMENT);
+                panel.add(title);
+
+                panel.add(Box.createVerticalStrut(6));
+
+                JLabel elapsed = new JLabel("Elapsed: 0 s");
+                elapsed.setAlignmentX(Component.LEFT_ALIGNMENT);
+                panel.add(elapsed);
+
+                panel.add(Box.createVerticalStrut(8));
+
+                JProgressBar bar = new JProgressBar();
+                bar.setIndeterminate(true);
+                bar.setAlignmentX(Component.LEFT_ALIGNMENT);
+                bar.setMaximumSize(new Dimension(Integer.MAX_VALUE, bar.getPreferredSize().height));
+                panel.add(bar);
+
+                dialog.setContentPane(panel);
+                dialog.pack();
+                dialog.setSize(Math.max(dialog.getWidth(), 340), dialog.getHeight());
+                dialog.setLocationRelativeTo(null);
+                dialog.setAlwaysOnTop(true);
+                dialog.setVisible(true);
+
+                dialogRef[0] = dialog;
+                elapsedLabel[0] = elapsed;
+            });
+        } catch (Exception e) {
+            Log.warn("Could not show compile progress dialog", e);
+        }
+
+        // Update the elapsed-time label every second
+        Timer uiTimer = new Timer("ChunkyCL-DialogTimer", true);
+        uiTimer.scheduleAtFixedRate(new TimerTask() {
+            @Override
+            public void run() {
+                long secs = (System.currentTimeMillis() - startTime) / 1000;
+                SwingUtilities.invokeLater(() -> {
+                    if (elapsedLabel[0] != null) {
+                        elapsedLabel[0].setText(String.format("Elapsed: %d s", secs));
+                    }
+                });
+            }
+        }, 1000, 1000);
+
+        // Block until compilation finishes (or fails)
+        try {
+            ContextManager.get();
+        } catch (Exception e) {
+            Log.error("OpenCL compilation failed", e);
+        }
+
+        uiTimer.cancel();
+
+        long totalSecs = (System.currentTimeMillis() - startTime) / 1000;
+        Log.info(String.format("ChunkyCL: Compilation finished (%d s). Launching UI...", totalSecs));
+
+        // Tear down the dialog
+        SwingUtilities.invokeLater(() -> {
+            if (dialogRef[0] != null) {
+                dialogRef[0].dispose();
+            }
+        });
     }
 
     private static void addImposterFilter(String id, ChunkyImposterGpuPostProcessingFilter.Filter f) {

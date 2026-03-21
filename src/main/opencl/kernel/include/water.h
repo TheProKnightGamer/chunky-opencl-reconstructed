@@ -171,9 +171,6 @@ bool Water_planeIntersect(Ray ray, float waterPlaneHeight, float octreeSize, boo
 
 // Apply water fog attenuation (exponential falloff based on distance in water).
 // Matches CPU Beer's law: attenuation = exp(-distance / waterVisibility).
-// The CPU applies pure absorption scaling — color is simply multiplied by the
-// attenuation factor. Water color is applied separately to the water surface
-// material (in updateOpacity / closestIntersect), not in the fog itself.
 float Water_fogAttenuation(float distance, float waterVisibility) {
     if (waterVisibility <= 0) return 0.0f;
     float a = distance / waterVisibility;
