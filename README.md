@@ -9,6 +9,7 @@ This is a plugin for [Chunky](https://github.com/chunky-dev/chunky), which harne
  - Glass rendering!
  - Emitter Sampling Strategies!
  - Sun Sampling Strategies!
+ - Faster Map Using GPU!
 
 ## Installation
 
@@ -19,17 +20,17 @@ Download the [latest plugin release](https://github.com/chunky-dev/chunky-opencl
 
 Select `ChunkyCL` as your renderer for the scene in the `Advanced` tab.
 
+
 ![image](https://user-images.githubusercontent.com/42661490/122492084-fc040580-cf99-11eb-9b08-b166dc25db41.png)
 
 ## Performance
 
-Rough performance with an RTX 2070 is around 400 times that of the traditional CPU renderer as of 2022-01-27.
+Rough performance with an RTX 6000(I got temporary access to one :D) vs 14700k rendering four regions with all emitter sampling at full HD in march 25 2026:
 
-Some settings have been added to improve render performance.
-* Indoor scenes should disable sunlight under `Lighting`
-* Draw depth may be adjusted under `Advanced`
-* Draw entities may be unchecked under `Advanced`
-* OpenCL Device selector under `Advanced`
+[TO BE INSERTED VERY SOON]
+
+I cut the CPU early as it took forever to render just four samples.
+
 
 ## Compatibility
 
