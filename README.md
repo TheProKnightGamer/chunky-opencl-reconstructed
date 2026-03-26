@@ -14,7 +14,7 @@ This is a plugin for [Chunky](https://github.com/chunky-dev/chunky), which harne
 ## Installation
 
 ### Note: This requires the `2.5.0` snapshots.
-Download the [latest plugin release](https://github.com/TheProKnightGamer/chunky-opencl-reconstructed/releases) and extract it. In the Chunky Launcher, expand `Advanced Settings` and click on `Manage plugins`. In the `Plugin Manager` window, click on `Add` and select the `.jar` file in the extracted zip file. Click on `Save` and start Chunky as usual.
+Download the [latest plugin release](https://github.com/TheProKnightGamer/chunky-opencl-reconstructed/releases). In the Chunky Launcher, expand `Advanced Settings` and click on `Manage plugins`. In the `Plugin Manager` window, click on `Add` and select the `.jar` file in the extracted zip file. Click on `Save` and start Chunky as usual.
 
 ![image](https://user-images.githubusercontent.com/42661490/116319916-28ef2580-a76c-11eb-9f93-86d444a349fd.png)
 
