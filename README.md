@@ -25,7 +25,7 @@ Select `ChunkyCL` as your renderer for the scene in the `Advanced` tab.
 
 ## Performance
 
-Rough performance with an RTX 6000(I got temporary access to one :D) vs 14700k rendering four regions with all emitter sampling at full HD in march 25, 2026:
+Rough performance with a Blackwell RTX 6000 Pro(I got temporary access to one :D) vs 14700k rendering four regions with all emitter sampling at full HD in march 25, 2026:
 <img width="1920" height="1011" alt="Screenshot from 2026-03-25 21-48-53" src="https://github.com/user-attachments/assets/4124bd21-b984-4f1e-8dfc-8009ccc6310f" />
 <img width="1920" height="1011" alt="Screenshot from 2026-03-25 21-46-48" src="https://github.com/user-attachments/assets/b7edfa75-ef16-43a0-96cb-cd401eec8825" />
 That's 84k samples per second vs 63 million samples per second, making complex scenes take mere minutes instead of several hours at 750x the speed of a high-end CPU!
