@@ -2,7 +2,7 @@
 
 This is a plugin for [Chunky](https://github.com/chunky-dev/chunky), which harnesses the power of the GPU with OpenCL 1.2+ to accelerate rendering.
 
-#### This is not the original, but a side project. I, myself, do not know much Java, so the majority of this is a test to see how well AI can move features from chunky to chunky-opencl
+#### Disclaimer: This is not the original; for the original chunky-opencl, go to [chunky-opencl](https://github.com/chunky-dev/chunky-opencl). I, myself, do not know much Java, so this was largely coded by AI through a lot of trial and error.
 
 ## Features currently implemented:
  - Full water rendering + settings!
@@ -31,6 +31,9 @@ Rough performance with an RTX 6000(I got temporary access to one :D) vs 14700k r
 That's 84k samples per second vs 63 million samples per second, making complex scenes take mere minutes instead of several hours at 750x the speed of a high-end CPU!
 (I cut the CPU early as it took forever to render just four samples.)
 
+<img width="169" height="100" alt="comparison" src="https://github.com/user-attachments/assets/1c2be74d-f3cf-4911-a16f-f62c10e53a75" />
+
+The map used in the test renders can be found here at [Tax' Future City](https://www.curseforge.com/minecraft/worlds/taxfuturecity)
 
 ## Compatibility
 
