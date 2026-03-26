@@ -18,6 +18,13 @@ jobs:
         java-version: '17'
         java-package: jdk
 
+    - name: Clone and build Chunky (latest master)
+      run: |
+        git clone --depth 1 https://github.com/chunky-dev/chunky.git /tmp/chunky
+        cd /tmp/chunky
+        chmod +x gradlew
+        ./gradlew :chunky:publishToMavenLocal
+
     - name: Grant execute permission for gradlew
       run: chmod +x gradlew
 
