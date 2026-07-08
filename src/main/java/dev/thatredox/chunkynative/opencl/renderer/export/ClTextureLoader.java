@@ -43,8 +43,9 @@ public class ClTextureLoader extends AbstractTextureLoader implements AutoClosea
 
     @Override
     protected void buildTextures(Object2ObjectMap<Texture, TextureRecord> textures) {
+        final double t = this.getAnimationTime();
         List<AtlasTexture> texs = textures.entrySet().stream()
-                .map(entry -> new AtlasTexture(entry.getKey(), entry.getValue()))
+                .map(entry -> new AtlasTexture(entry.getKey(), entry.getValue(), t))
                 .sorted().collect(Collectors.toList());
 
         ArrayList<boolean[][]> layers = new ArrayList<>();
@@ -131,8 +132,8 @@ public class ClTextureLoader extends AbstractTextureLoader implements AutoClosea
         public final int size;
         public int location = 0xFFFFFFFF;
 
-        protected AtlasTexture(Texture tex, TextureRecord record) {
-            this.exporter = TextureExporter.getExporter(tex);
+        protected AtlasTexture(Texture tex, TextureRecord record, double animationTime) {
+            this.exporter = TextureExporter.getExporter(tex, animationTime);
             this.record = record;
             this.size = (exporter.getWidth() << 16) | exporter.getHeight();
         }

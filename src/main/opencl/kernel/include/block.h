@@ -139,13 +139,34 @@ bool BlockPalette_intersectNormalizedBlock(BlockPalette self, image2d_array_t at
             return hit;
         }
         case 4: {
-            // Light block - invisible emitter in path tracing, visible in preview.
-            // Intersects as a small inset cube (0.125-0.875) matching CPU LightBlockModel.
-            // In path tracing: alpha is forced to 0 so Material_samplePdf always chooses
-            // doTransmit (pDiffuse=0), making the ray pass straight through with
-            // spectrum=(1,1,1). The block is invisible, but self-emission still fires
-            // at the hit point because it uses sample.color.xyz (ignoring alpha).
-            // In preview: alpha stays at 1 so the block is visible with placeholder texture.
+            // Light block — invisible emitter that should:
+            //   1. Be invisible in main render (no geometry visible)
+            //   2. Emit light proportional to its level (1-15)
+            //   3. Light up surrounding surfaces via emitter NEE
+            //
+            // Behaviour by ray kind (path-trace mode):
+            //   Camera/indirect ray: AABB intersect succeeds, alpha forced
+            //     to 0 so Material_samplePdf picks doTransmit (pDiffuse=0).
+            //     The block is transparent but self-emission still fires
+            //     at the hit because emittance uses sample.color.xyz
+            //     ignoring alpha. → camera sees a glow at the block's
+            //     position, scene behind is visible through it.
+            //   Shadow ray (sun/emitter NEE): SKIP entirely (return false).
+            //     Without this skip, emitter NEE shadow rays cast at the
+            //     light block's outer-cube face would hit the inset
+            //     0.125-0.875 cube first and the distance check
+            //     (srec.distance >= dist - 1e-4f) would fail, dropping
+            //     the contribution. The "Emitter invisible to rays"
+            //     branch in rayTracer.c relies on shadowClear=true to
+            //     fire the look-up-from-octree path that actually
+            //     samples the light block's emittance for NEE.
+            //
+            // Preview mode: alpha stays at 1 so the block renders with
+            //   the chunky placeholder texture (so the user can see and
+            //   place them while editing).
+            if ((ray.flags & RAY_SHADOW) && !(ray.flags & RAY_PREVIEW)) {
+                return false;
+            }
             AABB box = AABB_new(0.125f, 0.875f, 0.125f, 0.875f, 0.125f, 0.875f);
             hit = AABB_full_intersect(box, tempRay, &tempRecord);
             tempRecord.material = modelPointer;

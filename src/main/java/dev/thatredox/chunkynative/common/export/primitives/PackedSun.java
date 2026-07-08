@@ -7,6 +7,9 @@ import se.llbit.chunky.renderer.scene.sky.Sun;
 import se.llbit.math.ColorUtil;
 
 public class PackedSun implements Packer {
+    /** Must match constants.h DEFAULT_GAMMA. */
+    private static final double DEFAULT_GAMMA = 2.2;
+
     public final int flags;
     public final long texture;
     public final float intensity;
@@ -20,6 +23,10 @@ public class PackedSun implements Packer {
     public final int modifySunTexture;
     public final float importanceSampleChance;
     public final float importanceSampleRadius;
+    /** intensity^DEFAULT_GAMMA precomputed on host (slot 14). Replaces a per-work-item pow() in the kernel. */
+    public final float intensityPowGamma;
+    /** 1/luminosity precomputed on host (slot 15), or 1.0 when luminosity <= 0. */
+    public final float luminosityInv;
 
     public PackedSun(Sun sun, AbstractTextureLoader texturePalette) {
         flags = sun.drawTexture() ? 1 : 0;
@@ -35,10 +42,12 @@ public class PackedSun implements Packer {
         modifySunTexture = sun.getEnableTextureModification() ? 1 : 0;
         importanceSampleChance = (float) sun.getImportanceSampleChance();
         importanceSampleRadius = (float) sun.getImportanceSampleRadius();
+        intensityPowGamma = (float) Math.pow((double) intensity, DEFAULT_GAMMA);
+        luminosityInv = (luminosity > 0.0f) ? (1.0f / luminosity) : 1.0f;
     }
 
     /**
-     * Pack the sun into 15 ints.
+     * Pack the sun into 16 ints.
      * 0: Flags. 1 if the sun should be drawn. 0 if not.
      * 1 & 2: Sun texture reference.
      * 3: float sun intensity
@@ -52,11 +61,12 @@ public class PackedSun implements Packer {
      * 11: Modify sun texture flag (1 = yes, 0 = no)
      * 12: float importance sample chance
      * 13: float importance sample radius (multiplier on sun radius)
-     * 14: (reserved)
+     * 14: float intensity^DEFAULT_GAMMA (precomputed)
+     * 15: float 1/luminosity (precomputed; 1.0 if luminosity <= 0)
      */
     @Override
     public IntArrayList pack() {
-        IntArrayList out = new IntArrayList(15);
+        IntArrayList out = new IntArrayList(16);
         out.add(flags);
         out.add((int) (texture >>> 32));
         out.add((int) texture);
@@ -71,7 +81,8 @@ public class PackedSun implements Packer {
         out.add(modifySunTexture);
         out.add(Float.floatToIntBits(importanceSampleChance));
         out.add(Float.floatToIntBits(importanceSampleRadius));
-        out.add(0); // reserved
+        out.add(Float.floatToIntBits(intensityPowGamma));
+        out.add(Float.floatToIntBits(luminosityInv));
         return out;
     }
 }

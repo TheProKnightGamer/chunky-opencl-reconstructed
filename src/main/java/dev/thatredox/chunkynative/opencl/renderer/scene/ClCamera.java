@@ -79,9 +79,15 @@ public class ClCamera implements AutoCloseable {
                 String filename = Reflection.getFieldValueNullable(camera, "apertureMaskFilename", String.class);
                 if (filename != null && !filename.isEmpty()) {
                     BitmapImage mask = ImageLoader.read(new File(filename));
-                    if (mask != null) {
+                    if (mask != null && mask.width == mask.height) {
                         apertureMaskWidth = mask.width;
                         apertureMaskBuffer = new ClIntBuffer(mask.data, context);
+                    } else {
+                        // CPU ApertureProjector.loadApertureMask rejects non-square
+                        // masks. The kernel indexes row*width+col with row clamped
+                        // to width, so a non-square mask reads out of bounds (or
+                        // samples the wrong region). Fall back to a circle, as CPU.
+                        apertureShapeId = 0;
                     }
                 }
             } catch (Exception e) {
@@ -100,10 +106,16 @@ public class ClCamera implements AutoCloseable {
                 break;
             case PARALLEL:
                 projType = 1;
-                settings.add((float) Camera.clampedFovTan(camera.getFov()));
+                // CPU ParallelProjector uses the RAW fov (world units), not
+                // clampedFovTan; and wraps it in ForwardDisplacementProjector(
+                // -worldDiagonalSize) to push the origin back. pset2 carries
+                // worldDiagonalSize (the GPU parallel kernel uses it for the
+                // back-push; it does not use subjectDistance).
+                settings.add((float) camera.getFov());
                 settings.add(camera.infiniteDoF() ? 0 : (float) (camera.getSubjectDistance() / camera.getDof()));
-                settings.add((float) camera.getSubjectDistance());
+                settings.add((float) (double) Reflection.getFieldValue(camera, "worldDiagonalSize", Double.class));
                 settings.add((float) apertureShapeId);
+                settings.add((float) camera.getSubjectDistance()); // pset4: parallel DoF focus
                 break;
             case FISHEYE:
                 projType = 2;
@@ -151,6 +163,12 @@ public class ClCamera implements AutoCloseable {
                 // Fall through to pre-generated rays
                 break;
         }
+
+        // Pad to 19 floats so pset0..pset4 (cameraSettings[14..18], which
+        // CameraCache_load ALWAYS reads) are in bounds. Most projectors pack 4
+        // slots; parallel packs 5 (subjectDistance); ODS packs 1-2 — pad the rest
+        // with zeros. Without this the kernel read past the buffer end (UB).
+        while (settings.size() < 19) settings.add(0.0f);
 
         needGenerate = projType == -1;
 

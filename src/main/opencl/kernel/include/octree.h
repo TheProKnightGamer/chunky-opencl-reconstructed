@@ -146,6 +146,16 @@ bool Octree_exitWater(Octree self, image2d_array_t atlas, BlockPalette palette, 
 
     int depth = self.depth;
 
+    // Track the most-recently-visited water cell. When the ray finally
+    // exits to a non-water cell, we use this to populate record.material
+    // with the water material id so downstream water-specific logic in
+    // closestIntersect (waterOpacity override, biome tint, water shading)
+    // fires correctly. Previously we wrote material=-1 which silently
+    // disabled all of those — full water blocks looked unshaded and
+    // ignored the user's waterOpacity setting.
+    int lastWaterMaterial = -1;
+    int lastWaterData = 0;
+
     // Check if we are in bounds
     if (!AABB_inside(self.bounds, ray.origin)) {
         float dist = AABB_quick_intersect(self.bounds, ray.origin, invD);
@@ -194,22 +204,52 @@ bool Octree_exitWater(Octree self, image2d_array_t atlas, BlockPalette palette, 
                 return false;
             }
             record->distance = distMarch;
-            // Normal is the face we entered through (opposite of ray direction's dominant axis at boundary)
-            // Use the cell boundary we just crossed
-            record->normal = (float3)(0, 1, 0); // default up
-            record->material = -1; // water exit marker
-            record->blockData = 0;
-            // Set up water material sample for the exit boundary
-            sample->color = (float4)(1.0f, 1.0f, 1.0f, 1.0f);
-            sample->emittance = 0.0f;
-            sample->specular = 0.12f;
-            sample->metalness = 0.0f;
-            sample->roughness = 0.0f;
-            sample->ior = 1.333f;
-            sample->refractive = true;
-            sample->sss = false;
-            sample->isWater = true;
-            sample->tintType = 3;  // water biome tint (applied by applyBiomeTint)
+            // Exit-face normal pointing AGAINST ray direction (chunky's
+            // convention: surface normal points INTO the previous medium —
+            // here that's the water we just left). For the cell boundary
+            // most-recently crossed, the dominant ray-direction axis
+            // identifies the exit face. CPU PathTracer.invertNormal()
+            // achieves the same effect when currentMat==Air after a water
+            // hit; previously we hard-coded (0,1,0) which gave wrong
+            // refraction for any ray direction other than straight up
+            // (and inverted lighting on lateral water-cell exits).
+            float3 absD = fabs(ray.direction);
+            if (absD.x >= absD.y && absD.x >= absD.z) {
+                record->normal = (float3)(-copysign(1.0f, ray.direction.x), 0.0f, 0.0f);
+            } else if (absD.y >= absD.z) {
+                record->normal = (float3)(0.0f, -copysign(1.0f, ray.direction.y), 0.0f);
+            } else {
+                record->normal = (float3)(0.0f, 0.0f, -copysign(1.0f, ray.direction.z));
+            }
+
+            if (lastWaterMaterial >= 0) {
+                // Use the water material from the last cell we marched
+                // through. Material_sample populates color / emittance /
+                // ior / specular / etc. from the actual palette rather
+                // than the previous hard-coded "default water" values
+                // (which ignored e.g. resource-pack water tints).
+                record->material = lastWaterMaterial;
+                record->blockData = lastWaterData;
+                Material material = Material_get(materialPalette, lastWaterMaterial);
+                Material_sample(material, atlas, (float2)(0.5f, 0.5f), sample);
+                sample->isWater = true;
+            } else {
+                // Fallback for the rare case the caller invoked
+                // exitWater with ray.inWater true but no water cell was
+                // actually visited (e.g. floating-point boundary case).
+                record->material = -1;
+                record->blockData = 0;
+                sample->color = (float4)(1.0f, 1.0f, 1.0f, 1.0f);
+                sample->emittance = 0.0f;
+                sample->specular = 0.12f;
+                sample->metalness = 0.0f;
+                sample->roughness = 0.0f;
+                sample->ior = 1.333f;
+                sample->refractive = true;
+                sample->sss = false;
+                sample->isWater = true;
+                sample->tintType = 3;
+            }
             return true;
         }
 
@@ -217,6 +257,9 @@ bool Octree_exitWater(Octree self, image2d_array_t atlas, BlockPalette palette, 
         int waterData = palette.blockPalette[data + 2];
         bool isFull = (waterData >> WATER_FULL_BLOCK) & 1;
         int materialPointer = palette.blockPalette[data + 1];
+        // Remember this water cell so a future non-water exit can use it.
+        lastWaterMaterial = materialPointer;
+        lastWaterData = data;
 
         if (!isFull) {
             // Surface water block — test top triangles (matching CPU WaterModel.intersectTop)

@@ -39,6 +39,12 @@ public abstract class AbstractSceneLoader {
     protected int[] worldBvh = null;
     protected int[] actorBvh = null;
     protected PackedSun packedSun = null;
+    /**
+     * Snapshot of scene.animationTime at the last texture build. If the user
+     * scrubs animation time, the atlas needs to repack so animated textures
+     * (fire) pick up the new frame.
+     */
+    protected double prevAnimationTime = Double.NaN;
 
     public boolean ensureLoad(Scene scene) {
         return this.ensureLoad(scene, false);
@@ -76,7 +82,9 @@ public abstract class AbstractSceneLoader {
         boolean needTextureLoad = resetReason == ResetReason.SCENE_LOADED ||
                 resetReason == ResetReason.MATERIALS_CHANGED ||
                 prevWorldBvh.get() != worldBvh ||
-                prevActorBvh.get() != actorBvh;
+                prevActorBvh.get() != actorBvh ||
+                Double.doubleToLongBits(scene.getAnimationTime())
+                        != Double.doubleToLongBits(prevAnimationTime);
 
         // Only create palettes when we actually need to rebuild textures/blocks/BVH.
         // For SETTINGS_CHANGED this avoids allocating 6 palette objects that would be
@@ -107,7 +115,13 @@ public abstract class AbstractSceneLoader {
             if (worldBvh != BVH.EMPTY) preloadBvh((BinaryBVH) worldBvh, texturePalette);
             if (actorBvh != BVH.EMPTY) preloadBvh((BinaryBVH) actorBvh, texturePalette);
             texturePalette.get(Sun.texture);
+            // Tell the texture loader about the scene's animation time so animated
+            // textures pack the right frame at scene-load time. Animation only
+            // updates when the scene reloads (matches GPU per-render snapshot).
+            double t = scene.getAnimationTime();
+            texturePalette.setAnimationTime(t);
             texturePalette.build();
+            prevAnimationTime = t;
 
             blockMapping = scene.getPalette().getPalette().stream()
                     .mapToInt(block ->
@@ -197,7 +211,57 @@ public abstract class AbstractSceneLoader {
             PackedBvhNode node = new PackedBvhNode(bvh.packed, i, bvh.packedPrimitives, texturePalette, materialPalette, trigPalette);
             System.arraycopy(node.pack().elements(), 0, out, i, 7);
         }
+
+        // The kernel walks BVHs with a fixed-size stack of 32 nodes. Pushes
+        // beyond that are silently dropped, which manifests as missing entity
+        // geometry on screen. Estimate worst-case depth here so the cause is
+        // obvious in the log instead of a "where did the painting go?" bug.
+        int maxDepth = estimateBvhDepth(out);
+        if (maxDepth > 30) {
+            Log.warn("ChunkyCL: BVH depth (" + maxDepth + ") approaches or exceeds "
+                    + "the kernel's 32-node traversal stack. Some entity primitives "
+                    + "may be skipped on the GPU. Reduce entity count or report this "
+                    + "scene if it reproduces.");
+        }
         return out;
+    }
+
+    /**
+     * Walk the packed BVH iteratively and return the deepest node's depth.
+     * Layout matches the kernel's interpretation: each interior node occupies
+     * 14 ints (this node's 7 + child offsets in node[0]); leaves have node[0] <= 0.
+     */
+    private static int estimateBvhDepth(int[] packed) {
+        if (packed.length == 0) return 0;
+        int[] stackNode = new int[64];
+        int[] stackDepth = new int[64];
+        int top = 0;
+        stackNode[top] = 0;
+        stackDepth[top] = 1;
+        top++;
+        int maxDepth = 0;
+        // Bound iterations defensively to avoid pathological loops on
+        // corrupted data; entity scenes never approach this many nodes.
+        int iter = 0;
+        while (top > 0 && iter++ < 1_000_000) {
+            top--;
+            int n = stackNode[top];
+            int d = stackDepth[top];
+            if (d > maxDepth) maxDepth = d;
+            if (n < 0 || n + 7 >= packed.length) continue;
+            int header = packed[n];
+            if (header <= 0) continue; // leaf
+            int rightOffset = header;
+            int leftOffset = n + 7;
+            if (top + 2 > stackNode.length) {
+                // Estimator stack would overflow — depth is already at least
+                // this many, plus more to come; bail with a conservative answer.
+                return Math.max(maxDepth, 32);
+            }
+            stackNode[top] = leftOffset; stackDepth[top++] = d + 1;
+            stackNode[top] = rightOffset; stackDepth[top++] = d + 1;
+        }
+        return maxDepth;
     }
 
     protected abstract boolean loadOctree(int[] octree, int depth, int[] blockMapping, ResourcePalette<PackedBlock> blockPalette);

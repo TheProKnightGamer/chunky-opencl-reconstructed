@@ -35,17 +35,32 @@ public class ClContext {
                 null, null, null);
 
 
+        this.queue = createCommandQueue();
+
+        // Check if version is behind
+        int[] version = device.version();
+        if (version[0] <= 1 && version[1] < 2) {
+            Log.error("OpenCL 1.2+ required.");
+        }
+    }
+
+    /**
+     * Create a NEW command queue on this context. Host threads other than the
+     * main render loop (e.g. the JavaFX-thread 2D map upscaler) MUST use their
+     * own queue rather than sharing {@link #queue}: the OpenCL spec requires the
+     * application to serialize host access to a single command queue, so
+     * concurrent clEnqueue* from multiple threads on one queue is undefined
+     * behavior. Independent queues on the same context are the supported
+     * multi-threaded pattern. Caller owns the returned queue and must
+     * clReleaseCommandQueue it.
+     */
+    public cl_command_queue createCommandQueue() {
         int[] version = device.version();
         if (version[0] >= 2) {
             cl_queue_properties queueProperties = new cl_queue_properties();
-            queue = clCreateCommandQueueWithProperties(context, device.device, queueProperties, null);
+            return clCreateCommandQueueWithProperties(context, device.device, queueProperties, null);
         } else {
-            queue = createCommandQueueOld(0);
-        }
-
-        // Check if version is behind
-        if (version[0] <= 1 && version[1] < 2) {
-            Log.error("OpenCL 1.2+ required.");
+            return createCommandQueueOld(0);
         }
     }
 
@@ -116,63 +131,93 @@ public class ClContext {
         cl_program[] includePrograms = new cl_program[includeNames.length];
         Arrays.setAll(includePrograms, i -> headerPrograms.get(includeNames[i]));
 
-        CL.setExceptionsEnabled(false);
-        int code = clCompileProgram(kernelProgram, 1, deviceArray, "-cl-std=CL1.2 -Werror -cl-mad-enable -cl-no-signed-zeros",
-                includePrograms.length, includePrograms, includeNames, null, null);
-        if (code != CL_SUCCESS) {
-            String error;
-            switch (code) {
-                case CL_INVALID_PROGRAM:
-                    error = "CL_INVALID_PROGRAM";
-                    break;
-                case CL_INVALID_VALUE:
-                    error = "CL_INVALID_VALUE";
-                    break;
-                case CL_INVALID_DEVICE:
-                    error = "CL_INVALID_DEVICE";
-                    break;
-                case CL_INVALID_COMPILER_OPTIONS:
-                    error = "CL_INVALID_COMPILER_OPTIONS";
-                    break;
-                case CL_INVALID_OPERATION:
-                    error = "CL_INVALID_OPERATION";
-                    break;
-                case CL_COMPILER_NOT_AVAILABLE:
-                    error = "CL_COMPILER_NOT_AVAILABLE";
-                    break;
-                case CL_COMPILE_PROGRAM_FAILURE:
-                    error = "CL_COMPILE_PROGRAM_FAILURE";
-                    break;
-                case CL_OUT_OF_RESOURCES:
-                    error = "CL_OUT_OF_RESOURCES";
-                    break;
-                case CL_OUT_OF_HOST_MEMORY:
-                    error = "CL_OUT_OF_HOST_MEMORY";
-                    break;
-                default:
-                    error = "Code " + code;
-                    break;
+        // Wrap in try/finally so the intermediate programs (kernelProgram and
+        // every entry in headerPrograms) are always released, regardless of
+        // whether compilation, linking, or caching succeeds. Each cl_program
+        // holds GPU-side IR + metadata; leaking them across many recompiles
+        // would accumulate driver memory.
+        cl_program linked = null;
+        try {
+            CL.setExceptionsEnabled(false);
+            // Per OpenCL spec, clCompileProgram returns CL_INVALID_VALUE when
+            // num_input_headers is 0 and header_include_names or input_headers
+            // are not NULL. Some drivers (e.g. AMD on certain configs) enforce
+            // this strictly and reject empty arrays; others (NVIDIA, Intel
+            // typically) accept them. The accumulator program has no #includes,
+            // so we explicitly pass null/0 in that case.
+            int numHeaders = includePrograms.length;
+            cl_program[] headersArg = numHeaders == 0 ? null : includePrograms;
+            String[] headerNamesArg = numHeaders == 0 ? null : includeNames;
+            int code = clCompileProgram(kernelProgram, 1, deviceArray, "-cl-std=CL1.2 -Werror -cl-mad-enable -cl-no-signed-zeros",
+                    numHeaders, headersArg, headerNamesArg, null, null);
+            if (code != CL_SUCCESS) {
+                String error;
+                switch (code) {
+                    case CL_INVALID_PROGRAM:
+                        error = "CL_INVALID_PROGRAM";
+                        break;
+                    case CL_INVALID_VALUE:
+                        error = "CL_INVALID_VALUE";
+                        break;
+                    case CL_INVALID_DEVICE:
+                        error = "CL_INVALID_DEVICE";
+                        break;
+                    case CL_INVALID_COMPILER_OPTIONS:
+                        error = "CL_INVALID_COMPILER_OPTIONS";
+                        break;
+                    case CL_INVALID_OPERATION:
+                        error = "CL_INVALID_OPERATION";
+                        break;
+                    case CL_COMPILER_NOT_AVAILABLE:
+                        error = "CL_COMPILER_NOT_AVAILABLE";
+                        break;
+                    case CL_COMPILE_PROGRAM_FAILURE:
+                        error = "CL_COMPILE_PROGRAM_FAILURE";
+                        break;
+                    case CL_OUT_OF_RESOURCES:
+                        error = "CL_OUT_OF_RESOURCES";
+                        break;
+                    case CL_OUT_OF_HOST_MEMORY:
+                        error = "CL_OUT_OF_HOST_MEMORY";
+                        break;
+                    default:
+                        error = "Code " + code;
+                        break;
+                }
+                CL.setExceptionsEnabled(true);
+                Log.error("Failed to build CL program: " + error);
+
+                long[] size = new long[1];
+                clGetProgramBuildInfo(kernelProgram, deviceArray[0], CL.CL_PROGRAM_BUILD_LOG, 0, null, size);
+
+                byte[] buffer = new byte[(int)size[0]];
+                clGetProgramBuildInfo(kernelProgram, deviceArray[0], CL.CL_PROGRAM_BUILD_LOG, buffer.length, Pointer.to(buffer), null);
+
+                throw new RuntimeException("Failed to build CL program with error: " + error + "\n" + new String(buffer, 0, buffer.length-1));
             }
             CL.setExceptionsEnabled(true);
-            Log.error("Failed to build CL program: " + error);
 
-            long[] size = new long[1];
-            clGetProgramBuildInfo(kernelProgram, deviceArray[0], CL.CL_PROGRAM_BUILD_LOG, 0, null, size);
+            linked = clLinkProgram(context, 1, deviceArray, "", 1,
+                    new cl_program[] { kernelProgram }, null, null, null);
 
-            byte[] buffer = new byte[(int)size[0]];
-            clGetProgramBuildInfo(kernelProgram, deviceArray[0], CL.CL_PROGRAM_BUILD_LOG, buffer.length, Pointer.to(buffer), null);
+            // --- Phase 4: Cache the compiled binary ---
+            saveBinaryToCache(linked, cacheKey, kernelName);
 
-            throw new RuntimeException("Failed to build CL program with error: " + error + "\n" + new String(buffer, 0, buffer.length-1));
+            return linked;
+        } finally {
+            // Release the intermediate (un-linked) programs. clLinkProgram
+            // produces a fresh cl_program; the inputs are no longer needed.
+            // Header programs are also no longer referenced once compile
+            // completes (or fails).
+            if (kernelProgram != null) {
+                try { clReleaseProgram(kernelProgram); } catch (Exception ignored) {}
+            }
+            for (cl_program hp : headerPrograms.values()) {
+                if (hp != null) {
+                    try { clReleaseProgram(hp); } catch (Exception ignored) {}
+                }
+            }
         }
-        CL.setExceptionsEnabled(true);
-
-        cl_program linked = clLinkProgram(context, 1, deviceArray, "", 1,
-                new cl_program[] { kernelProgram }, null, null, null);
-
-        // --- Phase 4: Cache the compiled binary ---
-        saveBinaryToCache(linked, cacheKey, kernelName);
-
-        return linked;
     }
 
     // ---- Binary Cache Helpers ----
@@ -215,6 +260,7 @@ public class ClContext {
     }
 
     private cl_program loadCachedBinary(String cacheKey) {
+        cl_program program = null;
         try {
             Path cacheFile = getCacheDir().resolve(cacheKey + ".bin");
             if (!Files.exists(cacheFile)) return null;
@@ -223,13 +269,17 @@ public class ClContext {
 
             CL.setExceptionsEnabled(false);
             int[] binaryStatus = new int[1];
-            cl_program program = clCreateProgramWithBinary(context, 1, deviceArray,
+            program = clCreateProgramWithBinary(context, 1, deviceArray,
                     new long[] { binary.length }, new byte[][] { binary }, binaryStatus, null);
 
             if (binaryStatus[0] != CL_SUCCESS) {
                 CL.setExceptionsEnabled(true);
                 Log.warn("ChunkyCL: Cached binary invalid (status " + binaryStatus[0] + "), recompiling...");
                 Files.deleteIfExists(cacheFile);
+                // Release the cl_program created by clCreateProgramWithBinary
+                // even on the invalid-status path — it exists but isn't usable.
+                try { clReleaseProgram(program); } catch (Exception ignored) {}
+                program = null;
                 return null;
             }
 
@@ -239,13 +289,24 @@ public class ClContext {
             if (code != CL_SUCCESS) {
                 Log.warn("ChunkyCL: Failed to build cached binary (code " + code + "), recompiling...");
                 Files.deleteIfExists(cacheFile);
+                try { clReleaseProgram(program); } catch (Exception ignored) {}
+                program = null;
                 return null;
             }
 
-            return program;
+            // Success: hand ownership to the caller; clear local so the
+            // catch-block release below doesn't free what we returned.
+            cl_program out = program;
+            program = null;
+            return out;
         } catch (Exception e) {
             CL.setExceptionsEnabled(true);
             Log.warn("ChunkyCL: Error loading cached binary: " + e.getMessage());
+            // If anything threw between createProgramWithBinary and the
+            // success return, the program reference would otherwise leak.
+            if (program != null) {
+                try { clReleaseProgram(program); } catch (Exception ignored) {}
+            }
             return null;
         }
     }

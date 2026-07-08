@@ -49,6 +49,12 @@ bool Bvh_intersect(Bvh self, image2d_array_t atlas, MaterialPalette palette, Ray
             currentNode = nodesToVisit[--toVisit];
         } else {
             int offset = node[0];
+            // Hint to fully unroll these 7-iter copies. The BVH layout is
+            // 7 ints per node (header + 6-float AABB); unrolling lets the
+            // compiler fold consecutive global-memory loads into a single
+            // wider transaction on GPUs that benefit from it. No FP math
+            // changes — same loads, same AABB ctor.
+            __attribute__((opencl_unroll_hint(7)))
             for (int i = 0; i < 7; i++) {
                 node[i] = self.bvh[currentNode + 7 + i];
             }
@@ -59,6 +65,7 @@ bool Bvh_intersect(Bvh self, image2d_array_t atlas, MaterialPalette palette, Ray
             );
             float t1 = AABB_quick_intersect(box, ray.origin, invDir);
 
+            __attribute__((opencl_unroll_hint(7)))
             for (int i = 0; i < 7; i++) {
                 node[i] = self.bvh[offset + i];
             }

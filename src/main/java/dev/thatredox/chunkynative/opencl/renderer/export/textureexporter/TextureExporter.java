@@ -12,11 +12,14 @@ public interface TextureExporter {
     boolean equals(TextureExporter other);
 
     static TextureExporter getExporter(Texture texture) {
+        return getExporter(texture, 0);
+    }
+    static TextureExporter getExporter(Texture texture, double animationTime) {
         if (texture instanceof SignTexture) {
             return new SignTextureExporter((SignTexture) texture);
         }
         if (texture instanceof AnimatedTexture) {
-            return new AnimatedTextureExporter((AnimatedTexture) texture);
+            return new AnimatedTextureExporter((AnimatedTexture) texture, animationTime);
         }
         return new DefaultTextureExporter(texture);
     }

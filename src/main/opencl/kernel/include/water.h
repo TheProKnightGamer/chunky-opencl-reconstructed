@@ -54,10 +54,14 @@ void Water_simplexShading(IntersectionRecord* record, float wx, float wz,
         amplitude *= 0.5f;
     }
 
-    // Compute normal from slopes using cross product of tangent vectors
+    // Compute normal from slopes using cross product of tangent vectors,
+    // matching CPU SimplexWaterShader (normal.cross(zslope, xslope)).
     // xslope = (1, ddx, 0), zslope = (0, ddz, 1)
-    // normal = cross(zslope, xslope) = (ddx, 1, ddz)  (unnormalized)
-    float3 n = (float3)(ddx, 1.0f, ddz);
+    // cross(zslope, xslope) = (-ddx, 1, -ddz)  (unnormalized)
+    // NOTE: the X and Z components are NEGATED — the previous code used
+    // (ddx, 1, ddz), which mirrored every wave's tilt and made simplex-water
+    // specular highlights / refraction offsets point the wrong way vs CPU.
+    float3 n = (float3)(-ddx, 1.0f, -ddz);
     n = normalize(n);
 
     // Flip the normal if the ray hit from below

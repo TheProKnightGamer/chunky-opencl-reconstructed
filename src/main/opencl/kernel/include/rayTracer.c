@@ -55,7 +55,12 @@ bool isInWater(SceneConfig scene, float3 origin) {
 #define SUN_SAMPLING_IMPORTANCE  3
 #define SUN_SAMPLING_HIGH_QUALITY 4
 
-// Cached camera constants (populated once per work-item from global memory)
+// Cached camera constants (populated once per work-item from global memory).
+// pset0..pset3 are the four projector-settings floats at cameraSettings[14..17];
+// they're scene-uniform and would otherwise be re-read from __global memory
+// inside every Camera_* call inside the iteration loop. Caching them as
+// scalars puts them in registers so the iteration loop touches __global
+// cameraSettings only for the pre-gen ray fallback (projType == -1).
 typedef struct {
     int projType;
     int width;
@@ -63,12 +68,16 @@ typedef struct {
     int cropX, cropY;
     float shiftX, shiftY;
     float3 cameraPos, m1s, m2s, m3s;
+    float pset0, pset1, pset2, pset3, pset4;
 } CameraCache;
 
+// projectorType (1 int) and canvasConfig (6 ints) are uniform → __constant.
+// cameraSettings stays __global because pre-gen ray modes can hold one ray
+// per pixel (up to ~12 MB at 1080p) which won't fit in constant memory.
 CameraCache CameraCache_load(
-        const __global int* projectorType,
-        const __global float* cameraSettings,
-        const __global int* canvasConfig
+        __constant const int* projectorType,
+        __global const float* cameraSettings,
+        __constant const int* canvasConfig
 ) {
     CameraCache cc;
     cc.projType = *projectorType;
@@ -86,6 +95,15 @@ CameraCache CameraCache_load(
         cc.invHeight = 1.0f / fullHeight;
         cc.shiftX = cameraSettings[12];
         cc.shiftY = cameraSettings[13];
+        // Pull projector-specific settings (aperture/fov/subject-distance/
+        // shape, depending on projType) into register scalars so the
+        // iteration-loop Camera_* calls don't re-read them from __global
+        // memory each pass.
+        cc.pset0 = cameraSettings[14];
+        cc.pset1 = cameraSettings[15];
+        cc.pset2 = cameraSettings[16];
+        cc.pset3 = cameraSettings[17];
+        cc.pset4 = cameraSettings[18];  // 5th slot (parallel DoF subjectDistance)
     }
     return cc;
 }
@@ -102,38 +120,42 @@ Ray ray_to_camera(
     if (cc.projType != -1) {
         float x = -cc.halfWidth + ((gid % cc.width) + Random_nextFloat(random) + cc.cropX) * cc.invHeight;
         float y = -0.5f + ((gid / cc.width) + Random_nextFloat(random) + cc.cropY) * cc.invHeight;
-        x += cc.shiftX;
-        y -= cc.shiftY;
+        // Lens shift applies ONLY to pinhole (0) and parallel (1): on the CPU
+        // only those projectors are wrapped in a ShiftProjector. Applying it to
+        // the spherical/ODS projectors offset the whole rendered image.
+        if (cc.projType == 0 || cc.projType == 1) {
+            x += cc.shiftX;
+            y -= cc.shiftY;
+        }
 
-        __global const float* projSettings = cameraSettings + 14;
-
+        // Pass cached projector settings as scalars — no __global reads here.
         switch (cc.projType) {
             case 0:
-                ray = Camera_pinHole(x, y, random, projSettings, apertureMask, apertureMaskWidth);
+                ray = Camera_pinHole(x, y, random, cc.pset0, cc.pset1, cc.pset2, cc.pset3, apertureMask, apertureMaskWidth);
                 break;
             case 1:
-                ray = Camera_parallel(x, y, random, projSettings, apertureMask, apertureMaskWidth);
+                ray = Camera_parallel(x, y, random, cc.pset0, cc.pset1, cc.pset2, cc.pset3, cc.pset4, apertureMask, apertureMaskWidth);
                 break;
             case 2:
-                ray = Camera_fisheye(x, y, random, projSettings, apertureMask, apertureMaskWidth);
+                ray = Camera_fisheye(x, y, random, cc.pset0, cc.pset1, cc.pset2, cc.pset3, apertureMask, apertureMaskWidth);
                 break;
             case 3:
-                ray = Camera_stereographic(x, y, random, projSettings, apertureMask, apertureMaskWidth);
+                ray = Camera_stereographic(x, y, random, cc.pset0, cc.pset1, cc.pset2, cc.pset3, apertureMask, apertureMaskWidth);
                 break;
             case 4:
-                ray = Camera_panoramic(x, y, random, projSettings, apertureMask, apertureMaskWidth);
+                ray = Camera_panoramic(x, y, random, cc.pset0, cc.pset1, cc.pset2, cc.pset3, apertureMask, apertureMaskWidth);
                 break;
             case 5:
-                ray = Camera_panoramicSlot(x, y, random, projSettings, apertureMask, apertureMaskWidth);
+                ray = Camera_panoramicSlot(x, y, random, cc.pset0, cc.pset1, cc.pset2, cc.pset3, apertureMask, apertureMaskWidth);
                 break;
             case 6:
-                ray = Camera_ODS(x, y, random, projSettings);
+                ray = Camera_ODS(x, y, random, cc.pset0, cc.pset1);
                 break;
             case 7:
-                ray = Camera_ODSStacked(x, y, random, projSettings);
+                ray = Camera_ODSStacked(x, y, random, cc.pset0);
                 break;
             default:
-                ray = Camera_pinHole(x, y, random, projSettings, apertureMask, apertureMaskWidth);
+                ray = Camera_pinHole(x, y, random, cc.pset0, cc.pset1, cc.pset2, cc.pset3, apertureMask, apertureMaskWidth);
                 break;
         }
 
@@ -169,7 +191,7 @@ float3 getDirectLightAttenuation(
     shadow.origin = origin;
     shadow.direction = sunDir;
     shadow.material = 0;
-    shadow.flags = 0;
+    shadow.flags = RAY_SHADOW;
     shadow.currentIor = AIR_IOR;
     shadow.prevIor = AIR_IOR;
     shadow.inWater = isInWater(scene, origin);
@@ -188,7 +210,11 @@ float3 getDirectLightAttenuation(
         }
     }
 
-    for (int i = 0; i < 8; i++) {
+    // Up to 32 translucent layers (was 8). CPU is unbounded (while attenuation.w
+    // > 0); a cap of 8 let too much sun through deep glass/leaf stacks (brighter
+    // shadows / god rays than CPU). The loop still exits early on an opaque hit
+    // or a clear path, so this only costs extra work on deep translucent stacks.
+    for (int i = 0; i < 32; i++) {
         if (alphaAtt <= 0.0f) break;
 
         IntersectionRecord srec = IntersectionRecord_new();
@@ -256,15 +282,20 @@ float3 getDirectLightAttenuation(
 }
 
 __kernel void render(
-    __global const int* projectorType,
+    // Small uniform buffers in __constant memory: dedicated broadcast cache
+    // on most GPUs, reduces L1 pressure on the big buffers below. Total
+    // footprint of all __constant args here is well under 1 KB so it fits
+    // comfortably in any device's CL_DEVICE_MAX_CONSTANT_BUFFER_SIZE
+    // (spec minimum is 64 KB on OpenCL 1.2+).
+    __constant const int* projectorType,
     __global const float* cameraSettings,
     __global const int* apertureMask,
     int apertureMaskWidth,
 
-    __global const int* octreeDepth,
+    __constant const int* octreeDepth,
     __global const int* octreeData,
 
-    __global const int* waterOctreeDepth,
+    __constant const int* waterOctreeDepth,
     __global const int* waterOctreeData,
 
     __global const int* bPalette,
@@ -282,23 +313,23 @@ __kernel void render(
 
     image2d_t skyTexture,
 
-    __global const float* skyIntensity,
-    __global const int* sunData,
+    __constant const float* skyIntensity,
+    __constant const int* sunData,
 
-    __global const int* dynamicConfig,
-    __global const float* emitterIntensity,
+    __constant const int* dynamicConfig,
+    __constant const float* emitterIntensity,
     __global const int* emitterPositions,
     __global const int* positionIndexes,
     __global const int* constructedGrid,
-    __global const int* gridConfig,
-    __global const int* canvasConfig,
-    __global const int* rayDepth,
+    __constant const int* gridConfig,
+    __constant const int* canvasConfig,
+    __constant const int* rayDepth,
     int iterations,
 
     // New buffers for expanded features
-    __global const float* fogData,
-    __global const float* waterConfig,
-    __global const float* renderConfig,
+    __constant const float* fogData,
+    __constant const float* waterConfig,
+    __constant const float* renderConfig,
     __global const int* cloudData,
     __global const float* waterNormalMap,
     int waterNormalMapW,
@@ -307,15 +338,29 @@ __kernel void render(
     __global const int* chunkBitmap,
     int chunkBitmapSize,
 
-    __global float* res
+    __global float* res,
+
+    // Total pixel count. We over-launch fewer work-items than pixels and let
+    // each work-item iterate over multiple pixels via a grid-stride loop;
+    // this keeps warps full when individual paths terminate at very
+    // different bounce depths instead of stalling lockstep on the longest
+    // path in the warp. Bit-exact parity preserved because each pixel still
+    // gets the same RNG seed (gid * constant + iter * constant).
+    int pixelCount
 
 ) {
-    int gid = get_global_id(0);
+    int wid = get_global_id(0);
+    int stride = get_global_size(0);
 
     // Cooperative copy of material palette ints into per-work-group local cache.
     if (matCacheWords > 0) {
         int lid = get_local_id(0);
         int lsize = get_local_size(0);
+        // matCacheWords is bounded (host caps it) and lsize is typically
+        // 64-256, so this loop runs at most ~32-128 times per work-item.
+        // The hint lets the compiler unroll a few iterations and issue
+        // wider memory transactions where possible.
+        __attribute__((opencl_unroll_hint(8)))
         for (int i = lid; i < matCacheWords; i += lsize) {
             matCache[i] = matPalette[i];
         }
@@ -329,7 +374,14 @@ __kernel void render(
     scene.worldBvh = Bvh_new(worldBvhData, bvhTrigs, &scene.materialPalette);
     scene.actorBvh = Bvh_new(actorBvhData, bvhTrigs, &scene.materialPalette);
     scene.blockPalette = BlockPalette_new(bPalette, quadModels, aabbModels, &scene.materialPalette);
-    scene.drawDepth = 256;
+    // Cap the octree DDA at the worst-case number of leaf-cell crossings for a
+    // ray traversing the whole octree (the 3D-DDA diagonal bound, 3 * 2^depth),
+    // not a flat 256. The old 256 cap made distant geometry along shallow angles
+    // in large/wide scenes terminate early and dissolve into sky (CPU is
+    // uncapped). Clamped to 8192 so a pathological miss-ray on a huge octree
+    // can't stall a dispatch. Normal rays exit early (on hit or out-of-bounds),
+    // so this only affects long miss-rays.
+    scene.drawDepth = min(3 << max(scene.octree.depth, scene.waterOctree.depth), 8192);
 
     // Load water config: [enabled, height, chunkClip, octreeSize, shadingStrategy,
     //                      animationTime, visibility, r, g, b, useCustomColor, ior,
@@ -359,6 +411,24 @@ __kernel void render(
     //                       fancierTranslucency, transmissivityCap, biomeColorsEnabled,
     //                       cloudOffsetX, cloudOffsetZ, yMin, yMax, biomeYLevels]
     int sunSamplingStrategy = (int)renderConfig[0];
+    // Sun-strategy boolean flags. These mirror chunky's
+    // SunSamplingStrategy.java truth table 1:1; if upstream changes the
+    // table (or adds a strategy), update both sides together.
+    //   Strategy        | doSampling | diffuseSun | sunLuminosity | importance
+    //   OFF             |   false    |   true     |    true       |   false
+    //   NON_LUMINOUS    |   false    |   false    |    false      |   false
+    //   FAST            |   true     |   false    |    false      |   false
+    //   IMPORTANCE      |   false    |   true     |    true       |   true
+    //   HIGH_QUALITY    |   true     |   true     |    true       |   false
+    bool sunDoSampling   = (sunSamplingStrategy == SUN_SAMPLING_FAST
+                         || sunSamplingStrategy == SUN_SAMPLING_HIGH_QUALITY);
+    bool sunDiffuseSun   = (sunSamplingStrategy == SUN_SAMPLING_OFF
+                         || sunSamplingStrategy == SUN_SAMPLING_IMPORTANCE
+                         || sunSamplingStrategy == SUN_SAMPLING_HIGH_QUALITY);
+    bool sunIsLuminosity = (sunSamplingStrategy == SUN_SAMPLING_OFF
+                         || sunSamplingStrategy == SUN_SAMPLING_IMPORTANCE
+                         || sunSamplingStrategy == SUN_SAMPLING_HIGH_QUALITY);
+    bool sunIsImportance = (sunSamplingStrategy == SUN_SAMPLING_IMPORTANCE);
     scene.transparentSky = (renderConfig[1] > 0.5f);
     // branchCount is passed via dynamicConfig[4] so it updates per-frame (ramp-up logic)
     int branchCount = dynamicConfig[4];
@@ -394,8 +464,10 @@ __kernel void render(
     float cachedEmitterIntensity = *emitterIntensity;
     int cachedRayDepth = *rayDepth;
     float cachedSkyIntensity = *skyIntensity;
-    float cachedSunPower = pow(sun.intensity, DEFAULT_GAMMA);
-    float cachedSunLumInv = (sun.luminosity > 0.0f) ? (1.0f / sun.luminosity) : 1.0f;
+    // Sun pow(gamma) and 1/luminosity are precomputed on host (PackedSun
+    // slots 14 and 15). Saves one pow() and one divide per work-item.
+    float cachedSunPower = sun.intensityPowGamma;
+    float cachedSunLumInv = sun.luminosityInv;
     int gc_cellSize = 0, gc_offsetX = 0, gc_sizeX = 0;
     int gc_offsetY = 0, gc_sizeY = 0, gc_offsetZ = 0, gc_sizeZ = 0;
     if (emittersEnabled && samplingStrategy != 0 && gridConfig[2] > 0) {
@@ -408,11 +480,18 @@ __kernel void render(
         gc_sizeZ = gridConfig[6];
     }
 
+    // Cache camera constants once (avoids re-reading global memory each iteration).
+    // This is gid-independent so we hoist it outside the grid-stride loop —
+    // every pixel processed by this work-item shares the same camera setup.
+    CameraCache camCache = CameraCache_load(projectorType, cameraSettings, canvasConfig);
+
+    // Grid-stride loop: each work-item processes multiple pixels. When one
+    // pixel's path terminates fast (e.g. sky hit) the same work-item picks
+    // up the next pixel rather than the warp stalling on the longest-path
+    // thread. Empty inner-state per pixel — sumColor/sumAlpha reset.
+    for (int gid = wid; gid < pixelCount; gid += stride) {
     float3 sumColor = (float3)(0.0f, 0.0f, 0.0f);
     float sumAlpha = 0.0f;
-
-    // Cache camera constants once (avoids re-reading global memory each iteration)
-    CameraCache camCache = CameraCache_load(projectorType, cameraSettings, canvasConfig);
 
     for (int it = 0; it < iterations; ++it) {
         unsigned int randomState = randSeed + (unsigned int)(gid * 1664525u) + (unsigned int)(it * 1013904223u);
@@ -451,12 +530,14 @@ __kernel void render(
         if (!firstHit) {
             // Sky hit at depth 0
             if (scene.transparentSky) {
+                // CPU: a transparent-sky depth-0 miss does NOTHING — ray.color
+                // stays (0,0,0); no sky and no fog are added. The host blend reads
+                // only RGB (alpha is tracked separately), so RGB must be black.
                 alpha = 0.0f;
-            }
+                color = (float3)(0.0f);
+            } else {
             MaterialSample skySample;
-            bool diffuseSun = (sunSamplingStrategy == SUN_SAMPLING_OFF ||
-                               sunSamplingStrategy == SUN_SAMPLING_IMPORTANCE);
-            intersectSky(skyTexture, cachedSkyIntensity, sun, textureAtlas, ray, &skySample, diffuseSun);
+            intersectSky(skyTexture, cachedSkyIntensity, sun, textureAtlas, ray, &skySample, sunDiffuseSun);
             color = skySample.emittance * skySample.color.xyz;
 
             // CPU: when camera is in water and ray doesn't hit anything,
@@ -475,11 +556,15 @@ __kernel void render(
                     float3 skyScatterPos = ray.origin + ray.direction * skyScatterOff;
                     skyFogSunAtt = getDirectLightAttenuation(scene, textureAtlas,
                         skyScatterPos, sun.sw, FOG_LIMIT, strictDirectLight);
-                    skyFogSunInt = sun.intensity;
+                    // CPU fog inscatter is scaled by the sun-visibility alpha
+                    // (scatterLight.w), never by sun intensity. That alpha is
+                    // already folded into skyFogSunAtt, so the scale is 1.0.
+                    skyFogSunInt = 1.0f;
                 }
                 Fog_addSkyFog(fogConfig, &color, ray.origin, ray.direction,
                               skyFogSunAtt, skyFogSunInt);
             }
+            } // end else (!transparentSky)
 
             // Sky path doesn't enter the branch loop, but avgColor divides by
             // iterations*branchCount.  Scale up so the average is correct.
@@ -511,7 +596,6 @@ __kernel void render(
                 Ray bRay = ray;
                 float3 throughput = (float3)(1.0f);
                 float3 branchColor = (float3)(0.0f);
-                float totalAirDistance = firstAirDist;
                 float totalWaterDistance = firstWaterDist;
                 bool hitAnything = true;
                 bool lastWasSpecular = false;  // tracks whether the last bounce was specular (for sky fog)
@@ -519,7 +603,15 @@ __kernel void render(
                 MaterialSample sample = firstSample;
                 Material material = firstMaterial;
 
-                for (int depth = 0; depth < cachedRayDepth; depth++) {
+                // CPU PathTracer.java:126 checks `ray.depth + 1 >= rayDepth`
+                // BEFORE the bounce, so a rayDepth setting of N produces only
+                // N-1 actual NEE-counted bounces (the would-be N-th call enters
+                // pathTrace, hits the depth check, and returns black). Use the
+                // same effective bound here to match CPU sample contributions
+                // bounce-for-bounce.
+                int effectiveDepth = cachedRayDepth - 1;
+                if (effectiveDepth < 0) effectiveDepth = 0;
+                for (int depth = 0; depth < effectiveDepth; depth++) {
                     // For depth > 0, find next intersection
                     if (depth > 0) {
                         record = IntersectionRecord_new();
@@ -532,9 +624,7 @@ __kernel void render(
                                 throughput = (float3)(0.0f);
                             }
 
-                            bool diffuseSun = (sunSamplingStrategy == SUN_SAMPLING_OFF ||
-                                               sunSamplingStrategy == SUN_SAMPLING_IMPORTANCE);
-                            intersectSky(skyTexture, cachedSkyIntensity, sun, textureAtlas, bRay, &sample, diffuseSun);
+                            intersectSky(skyTexture, cachedSkyIntensity, sun, textureAtlas, bRay, &sample, sunDiffuseSun);
                             throughput *= sample.color.xyz;
                             branchColor += sample.emittance * throughput;
 
@@ -548,7 +638,10 @@ __kernel void render(
                                     float3 skyScatterPos2 = bRay.origin + bRay.direction * skyScatterOff2;
                                     skyFogSunAtt2 = getDirectLightAttenuation(scene, textureAtlas,
                                         skyScatterPos2, sun.sw, FOG_LIMIT, strictDirectLight);
-                                    skyFogSunInt2 = sun.intensity;
+                                    // Inscatter scale is 1.0 (the sun-visibility
+                                    // alpha is already in skyFogSunAtt2), not sun
+                                    // intensity — matching CPU Fog.addLayeredFog.
+                                    skyFogSunInt2 = 1.0f;
                                 }
                                 Fog_addSkyFog(fogConfig, &branchColor, bRay.origin, bRay.direction,
                                               skyFogSunAtt2, skyFogSunInt2);
@@ -556,11 +649,13 @@ __kernel void render(
                             break;
                         }
 
-                        // Track distance through air and water (for fog)
+                        // Track water distance (for Beer's-law water fog). Air/
+                        // atmospheric fog uses only the first camera->surface
+                        // segment (firstAirDist), matching CPU which fogs per
+                        // frame over ray.distance — NOT an accumulated multi-bounce
+                        // total, which over-darkened diffuse-GI scenes.
                         if (bRay.inWater) {
                             totalWaterDistance += record.distance;
-                        } else {
-                            totalAirDistance += record.distance;
                         }
                     }
 
@@ -586,7 +681,7 @@ __kernel void render(
                     throughput *= pdfSample.spectrum;
 
                     // Importance sampling: steer diffuse bounces toward the sun
-                    if (sunSamplingStrategy == SUN_SAMPLING_IMPORTANCE
+                    if (sunIsImportance
                         && !pdfSample.specular && !pdfSample.transmitted) {
                         DiffuseISResult isResult = _Material_diffuseReflectionIS(
                             record, sun.sw,
@@ -602,18 +697,26 @@ __kernel void render(
                         throughput *= isResult.throughputScale;
                     }
 
-                    // Emitter self-emission
+                    // Emitter self-emission. CPU adds emittance ONLY inside
+                    // doDiffuseReflection, so gate on a genuine diffuse bounce
+                    // (!specular && !transmitted), matching the sun-NEE gate.
+                    bool didSelfEmit = false;
                     if (emittersEnabled && sample.emittance > EPS
+                        && !pdfSample.specular && !pdfSample.transmitted
                         && (!preventNormalEmitterWithSampling || samplingStrategy == 0 || depth == 0)) {
                         float3 emColor = (float3)(sample.color.x * sample.color.x,
                                                   sample.color.y * sample.color.y,
                                                   sample.color.z * sample.color.z);
                         branchColor += emColor * sample.emittance * cachedEmitterIntensity * prevThroughput;
+                        didSelfEmit = true;
                     }
 
-                    // Emitter sampling via emitter grid (non-specular bounces only)
+                    // Emitter-grid NEE. CPU does this only on genuine diffuse
+                    // bounces, and ONLY when self-emission did not fire this bounce
+                    // (if/else-if in doDiffuseReflection). Gate: !specular &&
+                    // !transmitted && !didSelfEmit.
                     if (emittersEnabled && samplingStrategy != 0 && gc_sizeX > 0
-                        && !pdfSample.specular) {
+                        && !pdfSample.specular && !pdfSample.transmitted && !didSelfEmit) {
                         int cellSize = gc_cellSize;
                         int offsetX = gc_offsetX;
                         int sizeX = gc_sizeX;
@@ -622,9 +725,14 @@ __kernel void render(
                         int offsetZ = gc_offsetZ;
                         int sizeZ = gc_sizeZ;
 
-                        int gx = (int)floor(bRay.origin.x / (float)cellSize);
-                        int gy = (int)floor(bRay.origin.y / (float)cellSize);
-                        int gz = (int)floor(bRay.origin.z / (float)cellSize);
+                        // Select the emitter grid cell from the SURFACE hit point,
+                        // not bRay.origin (which is the camera at depth 0 / the
+                        // previous bounce otherwise). CPU uses ray.o = the advanced
+                        // hit point. Using the ray start sampled emitters from the
+                        // wrong cell (usually empty), under-lighting emitter scenes.
+                        int gx = (int)floor(hitPos.x / (float)cellSize);
+                        int gy = (int)floor(hitPos.y / (float)cellSize);
+                        int gz = (int)floor(hitPos.z / (float)cellSize);
 
                         if (gx >= offsetX && gx < offsetX + sizeX && gy >= offsetY && gy < offsetY + sizeY && gz >= offsetZ && gz < offsetZ + sizeZ) {
                             int idx = (((gy - offsetY) * sizeX) + (gx - offsetX)) * sizeZ + (gz - offsetZ);
@@ -661,6 +769,7 @@ __kernel void render(
                                         Ray shadow = bRay;
                                         shadow.origin = hitPoint;
                                         shadow.direction = dirToEmitter;
+                                        shadow.flags |= RAY_SHADOW;
                                         IntersectionRecord srec = IntersectionRecord_new();
                                         srec.distance = dist;
                                         Material sSample;
@@ -679,11 +788,12 @@ __kernel void render(
                                                                          : (float3)(0, 0, face == 4 ? -1.0f : 1.0f);
                                             }
                                             float cosEmitter = fabs(dot(dirToEmitter, srec.normal));
-                                            float att = fmax(0.0f, dot(record.normal, dirToEmitter)) * cosEmitter / fmax(dist * dist, 1.0f);
+                                            float att = cosEmitter / fmax(dist * dist, 1.0f); // CPU emitter NEE has no receiving-cosine weight (only the visibility gate)
                                             att *= avgFaceArea;
-                                            float3 emitterCol = (float3)(sMatSample.color.x * sMatSample.color.x * sMatSample.emittance,
-                                                                        sMatSample.color.y * sMatSample.color.y * sMatSample.emittance,
-                                                                        sMatSample.color.z * sMatSample.color.z * sMatSample.emittance);
+                                            // CPU emitter NEE uses the emitter's LINEAR color (sampleEmitterFace
+                                            // scaleAdds the raw color); the quadratic color^2 mapping is for
+                                            // direct self-emission ONLY. Squaring here darkened colored emitters.
+                                            float3 emitterCol = sMatSample.color.xyz * sMatSample.emittance;
                                             branchColor += throughput * cachedEmitterIntensity * emitterCol * att * (float)M_PI_F;
                                         }
                                     }
@@ -716,6 +826,7 @@ __kernel void render(
                                         Ray shadow = bRay;
                                         shadow.origin = hitPoint;
                                         shadow.direction = dirToEmitter;
+                                        shadow.flags |= RAY_SHADOW;
                                         IntersectionRecord srec = IntersectionRecord_new();
                                         srec.distance = dist;
                                         Material sSample;
@@ -733,11 +844,9 @@ __kernel void render(
                                                                          : (float3)(0, 0, face == 4 ? -1.0f : 1.0f);
                                             }
                                             float cosEmitter = fabs(dot(dirToEmitter, srec.normal));
-                                            float att = fmax(0.0f, dot(record.normal, dirToEmitter)) * cosEmitter / fmax(dist * dist, 1.0f);
+                                            float att = cosEmitter / fmax(dist * dist, 1.0f); // CPU emitter NEE has no receiving-cosine weight (only the visibility gate)
                                             att *= avgFaceArea;
-                                            float3 emitterCol = (float3)(sMatSample.color.x * sMatSample.color.x * sMatSample.emittance,
-                                                                        sMatSample.color.y * sMatSample.color.y * sMatSample.emittance,
-                                                                        sMatSample.color.z * sMatSample.color.z * sMatSample.emittance);
+                                            float3 emitterCol = sMatSample.color.xyz * sMatSample.emittance; // linear (not color^2)
                                             accCol += emitterCol * att;
                                         }
                                     }
@@ -770,6 +879,7 @@ __kernel void render(
                                             Ray shadow = bRay;
                                             shadow.origin = hitPoint;
                                             shadow.direction = dirToEmitter;
+                                            shadow.flags |= RAY_SHADOW;
                                             IntersectionRecord srec = IntersectionRecord_new();
                                             srec.distance = dist;
                                             Material sSample;
@@ -787,11 +897,9 @@ __kernel void render(
                                                                              : (float3)(0, 0, face == 4 ? -1.0f : 1.0f);
                                                 }
                                                 float cosEmitter = fabs(dot(dirToEmitter, srec.normal));
-                                                float att = fmax(0.0f, dot(record.normal, dirToEmitter)) * cosEmitter / fmax(dist * dist, 1.0f);
+                                                float att = cosEmitter / fmax(dist * dist, 1.0f); // CPU emitter NEE has no receiving-cosine weight (only the visibility gate)
                                                 att *= avgFaceArea;
-                                                float3 emitterCol = (float3)(sMatSample.color.x * sMatSample.color.x * sMatSample.emittance,
-                                                                            sMatSample.color.y * sMatSample.color.y * sMatSample.emittance,
-                                                                            sMatSample.color.z * sMatSample.color.z * sMatSample.emittance);
+                                                float3 emitterCol = sMatSample.color.xyz * sMatSample.emittance; // linear (not color^2)
                                                 accCol += emitterCol * att;
                                             }
                                         }
@@ -802,9 +910,14 @@ __kernel void render(
                         }
                     }
 
-                    // Sun direct light sampling (on non-specular bounces)
-                    if ((sunSamplingStrategy == SUN_SAMPLING_FAST || sunSamplingStrategy == SUN_SAMPLING_HIGH_QUALITY)
-                        && !pdfSample.specular) {
+                    // Sun direct light sampling. CPU does this ONLY inside
+                    // doDiffuseReflection — never on specular reflections or on
+                    // transmission/refraction. Gate on a true diffuse bounce
+                    // (!specular && !transmitted) so rays passing straight through
+                    // transparent texels don't pick up a spurious sun contribution.
+                    // Fires only for strategies with doSunSampling=true (FAST,
+                    // HIGH_QUALITY) per chunky's truth table.
+                    if (sunDoSampling && !pdfSample.specular && !pdfSample.transmitted) {
                         Ray sunRay;
                         sunRay.origin = hitPos;
                         if (Sun_sampleDirection(sun, &sunRay, random)) {
@@ -823,7 +936,12 @@ __kernel void render(
                                     sunHitPoint, sunRay.direction, FOG_LIMIT, strictDirectLight);
                                 if (sunAtt.x + sunAtt.y + sunAtt.z > 0.0f) {
                                     float mult = fabs(cosSun);
-                                    if (sunSamplingStrategy == SUN_SAMPLING_HIGH_QUALITY) {
+                                    // chunky CPU multiplies by 1/luminosity when
+                                    // isSunLuminosity()==true. NEE only fires for
+                                    // FAST and HIGH_QUALITY; of those FAST has
+                                    // sunLuminosity=false (skip) and HIGH_QUALITY
+                                    // has sunLuminosity=true (apply).
+                                    if (sunIsLuminosity) {
                                         mult *= cachedSunLumInv;
                                     }
                                     float3 sunContrib = sun.color.xyz * cachedSunPower * mult * sunAtt;
@@ -850,18 +968,31 @@ __kernel void render(
                         }
                     }
 
-                    if (!pdfSample.specular) {
+                    // Only DIFFUSE bounces become indirect. CPU doTransmission does
+                    // next.set(ray), preserving ray.specular, so a camera/specular
+                    // ray that passes straight through a semi-transparent texel
+                    // still hits the sky as an APPARENT (specular) sun — not the
+                    // ~60x brighter diffuse/luminosity sun. Refraction keeps
+                    // specular=true so it is unaffected.
+                    if (!pdfSample.specular && !pdfSample.transmitted) {
                         bRay.flags |= RAY_INDIRECT;
                     }
 
-                    // Russian roulette termination
-                    if (depth >= RR_START_DEPTH) {
-                        float pContinue = fmax(throughput.x, fmax(throughput.y, throughput.z));
-                        pContinue = fmin(pContinue, 0.95f);
-                        if (Random_nextFloat(random) > pContinue) {
-                            break;
-                        }
-                        throughput /= pContinue;
+                    // CPU parity: chunky's PathTracer uses a hard depth cutoff,
+                    // not Russian roulette. Termination happens via the depth
+                    // loop bound (cachedRayDepth).
+                    //
+                    // Throughput early-exit: if all three channels have decayed
+                    // below 1e-30f, any further bounce contributes effectively
+                    // zero to branchColor (max possible add < threshold *
+                    // emittance, which is far below fp32 precision for any
+                    // reasonable accumulator value). Bypasses the closestIntersect
+                    // for paths that can no longer contribute. The threshold
+                    // is tight enough that the branchColor difference is
+                    // sub-fp32-ULP — visually identical to the no-early-exit
+                    // version.
+                    if (fmax(fmax(throughput.x, throughput.y), throughput.z) < 1e-30f) {
+                        break;
                     }
                 } // end depth loop
 
@@ -873,19 +1004,33 @@ __kernel void render(
 
                 // Apply ground fog. Use scene entry point as fog origin so
                 // empty space between camera and octree doesn't inflate fog.
-                if (fogConfig.mode != FOG_MODE_NONE && totalAirDistance > 0.0f) {
+                //
+                // Sun inscatter for fog runs UNCONDITIONALLY in chunky CPU
+                // (PathTracer.java ~line 192-200) — the strategy gate only
+                // controls direct NEE, not the fog-light approximation. We
+                // previously gated this on `sunSamplingStrategy != OFF`,
+                // which made fog look brighter on GPU (no sun-occlusion
+                // attenuation) than on CPU when the user set strategy to
+                // OFF. Match CPU: always compute the attenuation.
+                // Atmospheric fog distance = first camera->surface segment. CPU
+                // applies it whether that segment is air OR water (prevMat==Air
+                // || prevMat.isWater()), so include firstWaterDist for the
+                // camera-underwater case (exactly one of the two is nonzero).
+                float groundFogDist = firstAirDist + firstWaterDist;
+                if (fogConfig.mode != FOG_MODE_NONE && groundFogDist > 0.0f) {
                     float3 fogOrigin = cameraOrigin + cameraDirection * emptySpaceDist;
-                    float fogOffset = Fog_sampleScatterOffset(fogConfig, totalAirDistance, fogOrigin, cameraDirection, random);
+                    float fogOffset = Fog_sampleScatterOffset(fogConfig, groundFogDist, fogOrigin, cameraDirection, random);
                     float3 sunDir = sun.sw;
-                    float sunInt = sun.intensity;
-                    float3 fogSunAtt = (float3)(1.0f);
-                    if (sunSamplingStrategy != SUN_SAMPLING_OFF) {
-                        float3 fogSamplePos = fogOrigin + cameraDirection * fogOffset;
-                        fogSunAtt = getDirectLightAttenuation(scene, textureAtlas,
-                            fogSamplePos, sunDir, FOG_LIMIT, strictDirectLight);
-                    }
+                    // CPU Fog.addGroundFog scales inscatter by the sun-visibility
+                    // alpha (scatterLight.w ≤ 1), NOT by sun intensity. That alpha
+                    // is already folded into fogSunAtt below, so the scalar is 1.0.
+                    // (Previously sun.intensity, making god rays 1.25x–50x too bright.)
+                    float sunInt = 1.0f;
+                    float3 fogSamplePos = fogOrigin + cameraDirection * fogOffset;
+                    float3 fogSunAtt = getDirectLightAttenuation(scene, textureAtlas,
+                        fogSamplePos, sunDir, FOG_LIMIT, strictDirectLight);
                     Fog_addGroundFog(fogConfig, &branchColor, fogOrigin, cameraDirection,
-                                     totalAirDistance, fogSunAtt, sunInt, fogOffset);
+                                     groundFogDist, fogSunAtt, sunInt, fogOffset);
                 }
 
                 color += branchColor;
@@ -904,16 +1049,17 @@ __kernel void render(
     // Store color + alpha (4 floats per pixel).
     // Alpha = 1 for opaque hits, 0 for transparent sky hits at depth 0.
     vstore4((float4)(avgColor, avgAlpha), gid, res);
+    } // end grid-stride loop
 }
 
 __kernel void preview(
-    __global const int* projectorType,
+    __constant const int* projectorType,
     __global const float* cameraSettings,
 
-    __global const int* octreeDepth,
+    __constant const int* octreeDepth,
     __global const int* octreeData,
 
-    __global const int* waterOctreeDepth,
+    __constant const int* waterOctreeDepth,
     __global const int* waterOctreeData,
 
     __global const int* bPalette,
@@ -928,16 +1074,18 @@ __kernel void preview(
     __global const int* matPalette,
 
     image2d_t skyTexture,
-    __global const float* skyIntensity,
-    __global const int* sunData,
+    __constant const float* skyIntensity,
+    __constant const int* sunData,
 
-    __global const int* canvasConfig,
-    __global const float* waterConfig,
+    __constant const int* canvasConfig,
+    __constant const float* waterConfig,
     __global const int* chunkBitmap,
     int chunkBitmapSize,
     __global const int* biomeData,
     int biomeDataSize,
     int biomeYLevels,
+    __constant const float* renderConfig,
+    __global const int* cloudData,
     __global int* res
 ) {
     int gid = get_global_id(0);
@@ -959,7 +1107,14 @@ __kernel void preview(
     scene.worldBvh = Bvh_new(worldBvhData, bvhTrigs, &scene.materialPalette);
     scene.actorBvh = Bvh_new(actorBvhData, bvhTrigs, &scene.materialPalette);
     scene.blockPalette = BlockPalette_new(bPalette, quadModels, aabbModels, &scene.materialPalette);
-    scene.drawDepth = 256;
+    // Cap the octree DDA at the worst-case number of leaf-cell crossings for a
+    // ray traversing the whole octree (the 3D-DDA diagonal bound, 3 * 2^depth),
+    // not a flat 256. The old 256 cap made distant geometry along shallow angles
+    // in large/wide scenes terminate early and dissolve into sky (CPU is
+    // uncapped). Clamped to 8192 so a pathological miss-ray on a huge octree
+    // can't stall a dispatch. Normal rays exit early (on hit or out-of-bounds),
+    // so this only affects long miss-rays.
+    scene.drawDepth = min(3 << max(scene.octree.depth, scene.waterOctree.depth), 8192);
 
     scene.waterPlaneEnabled = (waterConfig[0] > 0.5f);
     scene.waterPlaneHeight = waterConfig[1];
@@ -975,6 +1130,14 @@ __kernel void preview(
     scene.biomeData = biomeData;
     scene.biomeDataSize = biomeDataSize;
     scene.biomeYLevels = max(1, biomeYLevels);
+    // Clouds — the CPU preview renders them too. Cloud config lives in
+    // renderConfig[3,4,5,11,12] (same indices the main render kernel uses).
+    scene.cloudsEnabled = (renderConfig[3] > 0.5f);
+    scene.cloudHeight = renderConfig[4];
+    scene.cloudSize = renderConfig[5];
+    scene.cloudOffsetX = renderConfig[11];
+    scene.cloudOffsetZ = renderConfig[12];
+    scene.cloudData = cloudData;
 
     Sun sun = Sun_new(sunData);
 
@@ -1029,8 +1192,12 @@ __kernel void preview(
         // Apply biome tint and flat shading
         float3 previewHitPos = ray.origin + ray.direction * record.distance;
         applyBiomeTint(scene, &sample, previewHitPos);
+        // CPU Sun.flatShading multiplies albedo by previewEmittance * shading,
+        // where previewEmittance = pow(DEFAULT_INTENSITY=1.25, DEFAULT_GAMMA) is a
+        // CONSTANT (NOT the live sun intensity). Omitting it made the GPU preview
+        // ~1.6x darker (linear) than the CPU preview.
         float shading = fmax(0.3f, dot(record.normal, sun.sw));
-        float3 hitColor = sample.color.xyz * shading;
+        float3 hitColor = sample.color.xyz * shading * pow(1.25f, DEFAULT_GAMMA);
 
         if (sample.color.w < 1.0f - EPS) {
             // Semi-transparent: accumulate as tint layer (front-to-back compositing)
@@ -1090,7 +1257,7 @@ __kernel void preview(
                     bgColor *= 0.75f;
                 }
                 float gridShading = fmax(0.3f, sun.sw.y); // grid normal is (0,1,0)
-                bgColor *= gridShading;
+                bgColor *= gridShading * pow(1.25f, DEFAULT_GAMMA); // previewEmittance (see surface shading)
                 gridHit = true;
             }
         }
