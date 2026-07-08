@@ -24,9 +24,14 @@ typedef struct {
     float4 apparentColor;
     float importanceSampleChance;
     float importanceSampleRadius;
+    /** intensity^DEFAULT_GAMMA precomputed on host (slot 14 of sunData). */
+    float intensityPowGamma;
+    /** 1/luminosity precomputed on host (slot 15), or 1.0 when luminosity <= 0. */
+    float luminosityInv;
 } Sun;
 
-Sun Sun_new(__global const int* data) {
+// sunData is small (16 ints, ~64 B) and uniform — pass via __constant.
+Sun Sun_new(__constant const int* data) {
     Sun sun;
     sun.flags = data[0];
     sun.textureSize = data[1];
@@ -41,6 +46,12 @@ Sun Sun_new(__global const int* data) {
     sun.importanceSampleChance = as_float(data[12]);
     sun.importanceSampleRadius = as_float(data[13]);
     sun.radiusCos = cos(sun.radius);
+    // Precomputed scalars from host — saves a pow() and a divide per
+    // work-item per render pass. Host computation places these values
+    // in fp32, so all GPUs get bit-identical values regardless of vendor
+    // pow() precision (which can vary by several ULP).
+    sun.intensityPowGamma = as_float(data[14]);
+    sun.luminosityInv = as_float(data[15]);
 
     float phi = as_float(data[4]);
     float theta = as_float(data[5]);
@@ -88,16 +99,21 @@ bool Sun_intersect(Sun self, image2d_array_t atlas, Ray ray, MaterialSample* sam
         float b = M_PI_2_F - acos(dot(direction, self.sv)) + width;
         if (b >= 0 && b < width2) {
             if (isDiffuse) {
-                // CPU Sun.intersectDiffuse: texture_sample * color * 10
-                // Guard against invalid sun texture (textureSize==0 means not loaded)
+                // CPU addSunColorDiffuseSun: the intersectDiffuse result
+                // (texture * color * 10) is scaled by the sun's LUMINOSITY
+                // before being blended onto the sky. Without the luminosity
+                // factor (default 100) the sun is ~100x too dim as a light
+                // source in OFF / IMPORTANCE / HIGH_QUALITY modes, so diffuse
+                // surfaces barely receive any sunlight.
                 if (self.textureSize != 0) {
                     float4 color = Atlas_read_uv(a / width2, b / width2,
                                                  self.texture, self.textureSize, atlas);
-                    color.xyz *= self.color.xyz * 10.0f;
+                    color.xyz *= self.color.xyz * 10.0f * self.luminosity;
                     sample->color += color;
                 } else {
                     // Fallback: use flat sun color (no texture available)
-                    float4 color = self.color * 10.0f;
+                    float4 color = self.color;
+                    color.xyz *= 10.0f * self.luminosity;
                     sample->color += color;
                 }
             } else {
@@ -124,10 +140,10 @@ bool Sun_intersect(Sun self, image2d_array_t atlas, Ray ray, MaterialSample* sam
 }
 
 bool Sun_sampleDirection(Sun self, Ray* ray, Random random) {
-    if (!(self.flags & 1)) {
-        return false;
-    }
-
+    // CPU Sun.getRandomSunDirection does NOT gate on drawTexture: the sun still
+    // illuminates the scene via NEE even when the user hides the sun disk
+    // texture. Gating here would kill all direct sunlight (FAST/HIGH_QUALITY)
+    // whenever "draw sun texture" is disabled.
     float x1 = Random_nextFloat(random);
     float x2 = Random_nextFloat(random);
 

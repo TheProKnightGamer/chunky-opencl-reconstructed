@@ -56,6 +56,16 @@ public class GpuMapRenderer {
     private int lastDstSize;
     private WritableImage gpuImage;
 
+    // Dedicated command queue: this code runs on the JavaFX Application Thread,
+    // so it must NOT share the render thread's queue (concurrent host access to
+    // one OpenCL queue is undefined behavior). Independent queues on the same
+    // context are safe.
+    private cl_command_queue mapQueue;
+    // The ContextManager the cached queue/kernel/buffers belong to. When it is
+    // swapped (device switch / reload) the old resources are released and
+    // rebuilt — reusing them would enqueue on a released context and leak.
+    private ContextManager mapCtx;
+
     private volatile boolean installed = false;
 
     public GpuMapRenderer(Chunky chunky) {
@@ -91,9 +101,10 @@ public class GpuMapRenderer {
                     if (scene == null) return;
                     renderer.doInstall(scene);
                 } catch (Exception e) {
-                    Log.warn("ChunkyCL: Failed to install GPU map renderer", e);
-                    System.err.println("[ChunkyCL] GPU map install failed: " + e);
-                    e.printStackTrace();
+                    Log.warn("ChunkyCL: GPU map renderer install failed; the 2D "
+                            + "map will fall back to CPU rendering. This usually "
+                            + "means chunky's UI internals changed in a way the "
+                            + "plugin's reflection-based hook can't follow.", e);
                 }
             }));
 
@@ -135,19 +146,15 @@ public class GpuMapRenderer {
             return;
         }
 
-        // 4. Prepare reflection handles for MapBuffer's private state
-        mbPixelsField  = MapBuffer.class.getDeclaredField("pixels");
-        mbWidthField   = MapBuffer.class.getDeclaredField("width");
-        mbHeightField  = MapBuffer.class.getDeclaredField("height");
-        mbViewField    = MapBuffer.class.getDeclaredField("view");
-        mbCachedField  = MapBuffer.class.getDeclaredField("cached");
-        mbImageField   = MapBuffer.class.getDeclaredField("image");
-        mbPixelsField.setAccessible(true);
-        mbWidthField.setAccessible(true);
-        mbHeightField.setAccessible(true);
-        mbViewField.setAccessible(true);
-        mbCachedField.setAccessible(true);
-        mbImageField.setAccessible(true);
+        // 4. Prepare reflection handles for MapBuffer's private state. If chunky
+        //    renames any of these fields, report exactly which one so the cause
+        //    is obvious without poring through stack traces.
+        mbPixelsField  = requireField(MapBuffer.class, "pixels");
+        mbWidthField   = requireField(MapBuffer.class, "width");
+        mbHeightField  = requireField(MapBuffer.class, "height");
+        mbViewField    = requireField(MapBuffer.class, "view");
+        mbCachedField  = requireField(MapBuffer.class, "cached");
+        mbImageField   = requireField(MapBuffer.class, "image");
 
         // 5. Replace mapBuffer with our GpuMapBuffer wrapper.
         //    The field is 'protected final', so Field.set() may fail on some JVMs.
@@ -166,7 +173,18 @@ public class GpuMapRenderer {
 
         installed = true;
         Log.info("ChunkyCL: GPU map renderer installed successfully");
-        System.err.println("[ChunkyCL] GPU map renderer installed");
+    }
+
+    private static Field requireField(Class<?> cls, String name) throws NoSuchFieldException {
+        try {
+            Field f = cls.getDeclaredField(name);
+            f.setAccessible(true);
+            return f;
+        } catch (NoSuchFieldException e) {
+            throw new NoSuchFieldException("ChunkyCL: required private field '"
+                    + cls.getSimpleName() + "." + name + "' was not found. Chunky "
+                    + "may have renamed it; the GPU map hook needs to be updated.");
+        }
     }
 
     // ---- GPU-accelerated drawBuffered ----
@@ -232,7 +250,7 @@ public class GpuMapRenderer {
                 return true;
             }
         } catch (Exception e) {
-            System.err.println("[ChunkyCL] gpuDrawBuffered error: " + e.getMessage());
+            Log.warn("ChunkyCL: GPU map draw failed; falling back to CPU for this frame", e);
             return false;
         }
     }
@@ -244,6 +262,15 @@ public class GpuMapRenderer {
                            int srcOffsetX, int srcOffsetZ) {
         try {
             ContextManager ctx = ContextManager.get();
+            // Rebuild on first use or after a device switch/reload: the cached
+            // queue/kernel/buffers belong to a specific (now possibly released)
+            // context. Reusing them across a context swap enqueues on a dead
+            // context (CL_INVALID_CONTEXT) and leaks the old handles.
+            if (mapCtx != ctx) {
+                releaseGpuResources();
+                mapCtx = ctx;
+                mapQueue = ctx.context.createCommandQueue();
+            }
             int srcSize = src.length;
             int dstSize = dstWidth * dstHeight;
             if (dstSize <= 0) return null;
@@ -263,7 +290,7 @@ public class GpuMapRenderer {
             }
 
             // Upload source pixels (blocking – Java arrays are non-direct buffers)
-            clEnqueueWriteBuffer(ctx.context.queue, gpuSrcBuffer, CL_TRUE, 0,
+            clEnqueueWriteBuffer(mapQueue, gpuSrcBuffer, CL_TRUE, 0,
                     (long) Sizeof.cl_int * srcSize, Pointer.to(src), 0, null, null);
 
             // Create kernel on first use
@@ -282,26 +309,35 @@ public class GpuMapRenderer {
             clSetKernelArg(scaleKernel, ai++, Sizeof.cl_int, Pointer.to(new int[]{srcOffsetX}));
             clSetKernelArg(scaleKernel, ai++, Sizeof.cl_int, Pointer.to(new int[]{srcOffsetZ}));
 
-            clEnqueueNDRangeKernel(ctx.context.queue, scaleKernel, 1,
+            clEnqueueNDRangeKernel(mapQueue, scaleKernel, 1,
                     null, new long[]{dstSize}, null, 0, null, null);
 
             // Blocking read – waits for kernel to finish
             int[] dst = new int[dstSize];
-            clEnqueueReadBuffer(ctx.context.queue, gpuDstBuffer, CL_TRUE, 0,
+            clEnqueueReadBuffer(mapQueue, gpuDstBuffer, CL_TRUE, 0,
                     (long) Sizeof.cl_int * dstSize, Pointer.to(dst), 0, null, null);
             return dst;
 
         } catch (Exception e) {
-            System.err.println("[ChunkyCL] GPU mapScale failed: " + e.getMessage());
+            Log.warn("ChunkyCL: GPU mapScale kernel failed; this frame will fall back to CPU", e);
             return null;
         }
     }
 
-    /** Release GPU resources. */
-    public void cleanup() {
+    /** Release all cached GPU resources (kernel, buffers, queue). */
+    private void releaseGpuResources() {
         if (scaleKernel != null) { clReleaseKernel(scaleKernel); scaleKernel = null; }
         if (gpuSrcBuffer != null) { clReleaseMemObject(gpuSrcBuffer); gpuSrcBuffer = null; }
         if (gpuDstBuffer != null) { clReleaseMemObject(gpuDstBuffer); gpuDstBuffer = null; }
+        if (mapQueue != null) { clReleaseCommandQueue(mapQueue); mapQueue = null; }
+        lastSrcSize = 0;
+        lastDstSize = 0;
+    }
+
+    /** Release GPU resources. */
+    public void cleanup() {
+        releaseGpuResources();
+        mapCtx = null;
     }
 
     // ---- Reflection helpers ----

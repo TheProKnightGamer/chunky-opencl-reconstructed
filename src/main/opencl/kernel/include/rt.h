@@ -3,8 +3,16 @@
 
 #include "../opencl.h"
 
-#define RAY_INDIRECT 0b01
-#define RAY_PREVIEW  0b10
+#define RAY_INDIRECT 0b001
+#define RAY_PREVIEW  0b010
+// Ray cast as a shadow / visibility test (sun NEE, emitter NEE). Used to
+// gate light-block intersection: light blocks must be invisible to shadow
+// rays so emitter-NEE shadow rays reach the actual emitter face instead
+// of being blocked by the light block's own inset cube. Without this the
+// light block contributes zero light to NEE-sampled hits — i.e. light
+// blocks emit no usable light into the scene, only a glow at their own
+// position via self-emission at depth 0.
+#define RAY_SHADOW   0b100
 
 typedef struct {
     float3 origin;

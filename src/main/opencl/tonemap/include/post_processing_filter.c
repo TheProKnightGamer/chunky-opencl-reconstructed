@@ -37,15 +37,55 @@ __kernel void filter(
             color = pow(color, 1.0f / 2.2f);
             break;
         case 3:
-            // HABLE
-            color *= 16;
+            // HABLE — FILMIC_WORLDS preset fallback. Prefer hable_filter kernel
+            // for user-configurable parameters. Match HableToneMappingFilter.java:
+            // exposure bias *2, then curve, then whiteScale, then gamma 1/2.2.
+            color *= 2.0f;
             color = ((color * (0.15f * color + 0.10f * 0.50f) + 0.20f * 0.02f) / (color * (0.15f * color + 0.50f) + 0.20f * 0.30f)) - 0.02f / 0.30f;
             color /= (((11.2f * (0.15f * 11.2f + 0.10f * 0.50f) + 0.20f * 0.02f) / (11.2f * (0.15f * 11.2f + 0.50f) + 0.20f * 0.30f)) - 0.02f / 0.30f);
+            color = pow(color, 1.0f / 2.2f);
             break;
         default:
             // NONE: exposure already applied above, color_to_argb clamps to [0,1]
             break;
     }
+
+    float4 pixel;
+    pixel.xyz = color;
+    pixel.w = 1;
+    res[gid] = color_to_argb(pixel);
+}
+
+
+__kernel void hable_filter(
+        const int width,
+        const int height,
+        const float exposure,
+        __global const imposter_double* input,
+        __global unsigned int* res,
+
+        const float hA,
+        const float hB,
+        const float hC,
+        const float hD,
+        const float hE,
+        const float hF,
+        const float whiteScale
+) {
+    int gid = get_global_id(0);
+    int offset = gid * 3;
+
+    float color_float[3];
+    for (int i = 0; i < 3; i++) {
+        color_float[i] = idouble_to_float(input[offset + i]);
+    }
+    float3 color = vload3(0, color_float);
+    color *= exposure;
+
+    color *= 2.0f;
+    color = ((color * (hA * color + hC * hB) + hD * hE) / (color * (hA * color + hB) + hD * hF)) - hE / hF;
+    color *= whiteScale;
+    color = pow(color, 1.0f / 2.2f);
 
     float4 pixel;
     pixel.xyz = color;
@@ -98,7 +138,7 @@ __kernel void ue4_filter(
         ue4_filter_process_component(color.z, saturation, slope, toe, shoulder, blackClip, whiteClip, ta, sa)
     );
     color = clamp(color, 0.0f, 1.0f);
-    color = pow(color, 1.0f / 2.0f);
+    color = pow(color, 1.0f / 2.2f);
 
     float4 pixel;
     pixel.xyz = color;

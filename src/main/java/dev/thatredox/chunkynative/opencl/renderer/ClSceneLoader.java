@@ -19,6 +19,7 @@ import dev.thatredox.chunkynative.opencl.util.ClIntBuffer;
 import dev.thatredox.chunkynative.util.FunctionCache;
 import dev.thatredox.chunkynative.util.Reflection;
 import se.llbit.chunky.renderer.ResetReason;
+import se.llbit.log.Log;
 import se.llbit.chunky.renderer.scene.Fog;
 import se.llbit.chunky.renderer.scene.FogLayer;
 import se.llbit.chunky.renderer.scene.FogMode;
@@ -115,6 +116,14 @@ public class ClSceneLoader extends AbstractSceneLoader {
             resetGeneration.incrementAndGet();
         }
 
+        // Reset scene-specific buffers on new scene load so they get re-exported
+        if (resetReason == ResetReason.SCENE_LOADED) {
+            if (biomeDataBuffer != null) { biomeDataBuffer.close(); biomeDataBuffer = null; }
+            if (chunkBitmapBuffer != null) { chunkBitmapBuffer.close(); chunkBitmapBuffer = null; }
+            prevChunkBitmap = null;
+            prevChunkBitmapChunksPerSide = 0;
+        }
+
         // Check if sky changed
         SkyState newSky = new SkyState(scene.sky(), scene.sun());
         if (!newSky.equals(skyState)) {
@@ -196,7 +205,13 @@ public class ClSceneLoader extends AbstractSceneLoader {
                 }
             }
         } catch (Exception e) {
-            // If emitter grid export fails, clear buffers
+            // If emitter grid export fails (e.g. chunky renamed a private field
+            // on Grid), clear buffers and surface a warning. Without the warning
+            // emitter sampling silently disables itself, which previously made
+            // "no light from glowstone" look like a renderer bug.
+            Log.warn("ChunkyCL: failed to export emitter grid via reflection; "
+                    + "emitter sampling will be disabled until this is resolved. "
+                    + "Chunky's Grid class may have changed.", e);
             prevConstructedGrid = null;
             prevPosIndexes = null;
             prevEmitPos = null;
@@ -422,6 +437,14 @@ public class ClSceneLoader extends AbstractSceneLoader {
         try {
             scene.getGrassColor(0, 0, 0);
         } catch (NullPointerException e) {
+            // Biome textures aren't ready yet. Do NOT leave biomeDataBuffer null —
+            // the kernel arg setup dereferences it (getBiomeData().get()) and would
+            // NPE-crash the render thread, stickily (this method early-returns while
+            // biomeDataBuffer != null, so it never retries until the next scene
+            // load). Upload a disabled-biome placeholder like the other branches.
+            biomeDataSize = 0;
+            biomeYLevels = 1;
+            biomeDataBuffer = new ClIntBuffer(new int[] {0}, context);
             return;
         }
 

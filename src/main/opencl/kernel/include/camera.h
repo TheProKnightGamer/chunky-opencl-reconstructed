@@ -111,13 +111,15 @@ void Camera_sampleAperture(float aperture, int apertureShape, Random random, flo
 }
 
 // Projector type 0: Standard pinhole/perspective
-Ray Camera_pinHole(float x, float y, Random random, __global const float* projectorSettings,
+// Settings: pset0=aperture, pset1=subjectDistance, pset2=fovTan, pset3=apertureShape.
+Ray Camera_pinHole(float x, float y, Random random,
+                   float pset0, float pset1, float pset2, float pset3,
                    __global const int* apertureMask, int apertureMaskWidth) {
     Ray ray;
-    float aperture = projectorSettings[0];
-    float subjectDistance = projectorSettings[1];
-    float fovTan = projectorSettings[2];
-    int apertureShape = (int)projectorSettings[3];
+    float aperture = pset0;
+    float subjectDistance = pset1;
+    float fovTan = pset2;
+    int apertureShape = (int)pset3;
 
     ray.origin = (float3) (0, 0, 0);
     ray.direction = (float3) (fovTan * x, fovTan * y, 1.0f);
@@ -136,22 +138,38 @@ Ray Camera_pinHole(float x, float y, Random random, __global const float* projec
 }
 
 // Projector type 1: Parallel/orthographic
-Ray Camera_parallel(float x, float y, Random random, __global const float* projectorSettings,
+// Settings: pset0=fov (RAW world units), pset1=aperture, pset2=worldDiagonalSize,
+//           pset3=apertureShape.
+Ray Camera_parallel(float x, float y, Random random,
+                    float pset0, float pset1, float pset2, float pset3, float pset4,
                     __global const int* apertureMask, int apertureMaskWidth) {
     Ray ray;
-    float fovTan = projectorSettings[0];
-    float aperture = projectorSettings[1];
-    int apertureShape = (int)projectorSettings[3];
-    float worldWidth = fovTan * 2.0f;
+    float fov = pset0;
+    float aperture = pset1;
+    float worldDiagonalSize = pset2;
+    int apertureShape = (int)pset3;
+    float subjectDistance = pset4;
 
-    ray.origin = (float3) (worldWidth * x, worldWidth * y, 0);
+    // CPU ParallelProjector sets o = (fov*x, fov*y, 0) using the RAW fov (world
+    // units, NOT clampedFovTan). A ForwardDisplacementProjector(-worldDiagonalSize)
+    // then pushes the origin back by worldDiagonalSize along +z so the orthographic
+    // rays start behind the scene instead of on the camera plane (which clipped
+    // geometry in front of it). Direction stays (0,0,1).
+    ray.origin = (float3) (fov * x, fov * y, -worldDiagonalSize);
     ray.direction = (float3) (0, 0, 1.0f);
 
-    // For parallel projection, DoF is applied as lateral offset only (no convergence)
+    // CPU parallel DoF: an ApertureProjector with focus distance
+    // (subjectDistance + worldDiagonalSize) scales d to that distance, then
+    // d -= (rx,ry,0); o += (rx,ry,0) — CONVERGING rays with a sharp subject
+    // plane, not a pure lateral origin shift (which blurred every depth equally).
+    // ray_to_camera normalizes the direction after the world transform.
     if (aperture > 0) {
         float rx, ry;
         Camera_sampleAperture(aperture, apertureShape, random, &rx, &ry, apertureMask, apertureMaskWidth);
-        ray.origin += (float3)(rx, ry, 0);
+        float focusDist = subjectDistance + worldDiagonalSize;
+        ray.direction = (float3) (-rx, -ry, focusDist);
+        ray.origin.x += rx;
+        ray.origin.y += ry;
     }
     return ray;
 }
@@ -173,9 +191,12 @@ void Camera_applySphericalDoF(Ray* ray, float aperture, float subjectDistance, i
     float yaw = atan2(ray->direction.x, ray->direction.z);
     float pitch = asin(clamp(ray->direction.y, -1.0f, 1.0f));
 
-    // Build rotation matrix from yaw/pitch
-    float cosYaw = cos(-yaw);
-    float sinYaw = sin(-yaw);
+    // Build rotation matrix from yaw/pitch. CPU SphericalApertureProjector
+    // rotates the aperture point with Matrix3.rotate(-pitch, +yaw, 0). cos is
+    // even so cos(-yaw)==cos(yaw), but sin(-yaw) flipped the azimuth — mirroring
+    // asymmetric bokeh (hexagon/pentagon/star/custom). Use +yaw to match CPU.
+    float cosYaw = cos(yaw);
+    float sinYaw = sin(yaw);
     float cosPitch = cos(-pitch);
     float sinPitch = sin(-pitch);
 
@@ -189,16 +210,21 @@ void Camera_applySphericalDoF(Ray* ray, float aperture, float subjectDistance, i
 }
 
 // Projector type 2: Fisheye (equidistant)
-Ray Camera_fisheye(float x, float y, Random random, __global const float* projectorSettings,
+// Settings: pset0=fov, pset1=aperture, pset2=subjectDistance, pset3=apertureShape.
+Ray Camera_fisheye(float x, float y, Random random,
+                   float pset0, float pset1, float pset2, float pset3,
                    __global const int* apertureMask, int apertureMaskWidth) {
     Ray ray;
-    float fov = projectorSettings[0];
-    float aperture = projectorSettings[1];
-    float subjectDistance = projectorSettings[2];
-    int apertureShape = (int)projectorSettings[3];
+    float fov = pset0;
+    float aperture = pset1;
+    float subjectDistance = pset2;
+    int apertureShape = (int)pset3;
 
     float r = sqrt(x * x + y * y);
-    float theta = r * fov * M_PI_F / 360.0f;
+    // CPU FisheyeProjector: angleFromCenter = sqrt((degToRad(x*fov))^2 +
+    // (degToRad(y*fov))^2) = r * degToRad(fov). degToRad = *PI/180, NOT /360
+    // (the /360 here halved the field of view).
+    float theta = r * fov * M_PI_F / 180.0f;
 
     ray.origin = (float3)(0, 0, 0);
     if (r < EPS) {
@@ -213,13 +239,15 @@ Ray Camera_fisheye(float x, float y, Random random, __global const float* projec
 }
 
 // Projector type 3: Stereographic
-Ray Camera_stereographic(float x, float y, Random random, __global const float* projectorSettings,
+// Settings: pset0=fov, pset1=aperture, pset2=subjectDistance, pset3=apertureShape.
+Ray Camera_stereographic(float x, float y, Random random,
+                         float pset0, float pset1, float pset2, float pset3,
                          __global const int* apertureMask, int apertureMaskWidth) {
     Ray ray;
-    float fov = projectorSettings[0];
-    float aperture = projectorSettings[1];
-    float subjectDistance = projectorSettings[2];
-    int apertureShape = (int)projectorSettings[3];
+    float fov = pset0;
+    float aperture = pset1;
+    float subjectDistance = pset2;
+    int apertureShape = (int)pset3;
     float scale = 2.0f * tan(fov * M_PI_F / 720.0f);
 
     float xt = x * scale;
@@ -236,14 +264,18 @@ Ray Camera_stereographic(float x, float y, Random random, __global const float* 
 }
 
 // Projector type 4: Panoramic (equirectangular)
-Ray Camera_panoramic(float x, float y, Random random, __global const float* projectorSettings,
+// Settings: pset0=fov, pset1=aperture, pset2=subjectDistance, pset3=apertureShape.
+Ray Camera_panoramic(float x, float y, Random random,
+                     float pset0, float pset1, float pset2, float pset3,
                      __global const int* apertureMask, int apertureMaskWidth) {
     Ray ray;
-    float fov = projectorSettings[0];
-    float aperture = projectorSettings[1];
-    float subjectDistance = projectorSettings[2];
-    int apertureShape = (int)projectorSettings[3];
-    float fovRad = fov * M_PI_F / 360.0f;
+    float fov = pset0;
+    float aperture = pset1;
+    float subjectDistance = pset2;
+    int apertureShape = (int)pset3;
+    // CPU PanoramicProjector maps x->degToRad(x*fov), y->degToRad(y*fov).
+    // degToRad = *PI/180 (the /360 halved both yaw and pitch FOV).
+    float fovRad = fov * M_PI_F / 180.0f;
 
     float phi = x * fovRad;
     float theta = y * fovRad;
@@ -257,18 +289,24 @@ Ray Camera_panoramic(float x, float y, Random random, __global const float* proj
 }
 
 // Projector type 5: Panoramic slot
-Ray Camera_panoramicSlot(float x, float y, Random random, __global const float* projectorSettings,
+// Settings: pset0=fov, pset1=aperture, pset2=subjectDistance, pset3=apertureShape.
+Ray Camera_panoramicSlot(float x, float y, Random random,
+                         float pset0, float pset1, float pset2, float pset3,
                          __global const int* apertureMask, int apertureMaskWidth) {
     Ray ray;
-    float fov = projectorSettings[0];
-    float aperture = projectorSettings[1];
-    float subjectDistance = projectorSettings[2];
-    int apertureShape = (int)projectorSettings[3];
-    float fovRad = fov * M_PI_F / 360.0f;
-    float phi = x * fovRad;
+    float fov = pset0;
+    float aperture = pset1;
+    float subjectDistance = pset2;
+    int apertureShape = (int)pset3;
+    // CPU PanoramicSlotProjector: horizontal is spherical (degToRad(x*fov),
+    // i.e. *PI/180), but VERTICAL is pinhole-style — dy = clampedFovTan(fov)*y
+    // where clampedFovTan(f) = 2*tan(degToRad(clamp(f,0,180)/2)). The old code
+    // halved the yaw and used a linear vertical angle instead of the tangent.
+    float phi = x * fov * M_PI_F / 180.0f;
+    float fovTan = 2.0f * tan(clamp(fov, 0.0f, 180.0f) * M_PI_F / 360.0f);
 
     ray.origin = (float3)(0, 0, 0);
-    ray.direction = (float3)(sin(phi), y * fovRad, cos(phi));
+    ray.direction = (float3)(sin(phi), fovTan * y, cos(phi));
     ray.direction = normalize(ray.direction);
 
     Camera_applySphericalDoF(&ray, aperture, subjectDistance, apertureShape, random, apertureMask, apertureMaskWidth);
@@ -276,49 +314,58 @@ Ray Camera_panoramicSlot(float x, float y, Random random, __global const float* 
 }
 
 // Projector type 6: Omni-directional stereo (left/right)
-Ray Camera_ODS(float x, float y, Random random, __global const float* projectorSettings) {
+// Settings: pset0=ipd (inter-pupillary distance), pset1=side (-1 left, +1 right).
+// Exact replica of CPU ODSSinglePerspectiveProjector -> OmniDirectionalStereoProjector:
+// the single-perspective projector feeds apply(x+0.5, y+0.5, side*IPD/2), and
+// apply() uses theta = xr*PI - PI/2, phi = PI/2 - yr*PI. The previous code halved
+// the vertical span (used y*PI/2 -> ±45° instead of ±90°) and flipped the origin
+// z-sign (mirroring the stereo baseline).
+Ray Camera_ODS(float x, float y, Random random, float pset0, float pset1) {
     Ray ray;
-    float ipd = projectorSettings[0]; // inter-pupillary distance
-    float side = projectorSettings[1]; // -1 left, +1 right
+    float ipd = pset0;
+    float side = pset1;
 
-    float phi = x * M_PI_F;
-    float theta = y * M_PI_F * 0.5f;
+    float xr = x + 0.5f;
+    float yr = y + 0.5f;
+    float theta = xr * M_PI_F - M_PI_2_F;
+    float phi = M_PI_2_F - yr * M_PI_F;
+    float scale = ipd * 0.5f * side;
 
-    float cosT = cos(theta);
-    ray.direction = (float3)(sin(phi) * cosT, sin(theta), cos(phi) * cosT);
-
-    // Offset origin for stereo
-    float offset = ipd * 0.5f * side;
-    ray.origin = (float3)(cos(phi) * offset, 0, -sin(phi) * offset);
+    ray.origin = (float3)(cos(theta) * scale, 0.0f, sin(theta) * scale);
+    ray.direction = (float3)(sin(theta) * cos(phi), -sin(phi), cos(theta) * cos(phi));
     return ray;
 }
 
 // Projector type 7: ODS Stacked (both eyes in one image, top=left, bottom=right)
-Ray Camera_ODSStacked(float x, float y, Random random, __global const float* projectorSettings) {
+// Settings: pset0=ipd (inter-pupillary distance).
+// Exact replica of CPU ODSVerticalStackedProjector: left eye uses
+// apply(x*2+1, y*2+1, -IPD/2) for y<0, right eye apply(x*2+1, y*2, +IPD/2) for
+// y>=0, where apply() uses theta = xr*PI - PI/2, phi = PI/2 - yr*PI. The x*2+1
+// horizontal remap yields the full 360° sweep (the previous x*PI gave only 180°),
+// and the vertical span is the full ±90°.
+Ray Camera_ODSStacked(float x, float y, Random random, float pset0) {
     Ray ray;
-    float ipd = projectorSettings[0];
+    float ipd = pset0;
 
-    // Top half = left eye, bottom half = right eye
+    float xr = x * 2.0f + 1.0f;
+    float yr;
     float side;
-    float adjustedY;
-    if (y < 0) {
-        // Top half (y < 0 in normalized coords) = left eye
+    if (y < 0.0f) {
+        // Top half = left eye
+        yr = y * 2.0f + 1.0f;
         side = -1.0f;
-        adjustedY = y * 2.0f + 0.5f; // remap [-0.5, 0] to [-0.5, 0.5]
     } else {
-        // Bottom half (y >= 0) = right eye
+        // Bottom half = right eye
+        yr = y * 2.0f;
         side = 1.0f;
-        adjustedY = y * 2.0f - 0.5f; // remap [0, 0.5] to [-0.5, 0.5]
     }
 
-    float phi = x * M_PI_F;
-    float theta = adjustedY * M_PI_F * 0.5f;
+    float theta = xr * M_PI_F - M_PI_2_F;
+    float phi = M_PI_2_F - yr * M_PI_F;
+    float scale = ipd * 0.5f * side;
 
-    float cosT = cos(theta);
-    ray.direction = (float3)(sin(phi) * cosT, sin(theta), cos(phi) * cosT);
-
-    float offset = ipd * 0.5f * side;
-    ray.origin = (float3)(cos(phi) * offset, 0, -sin(phi) * offset);
+    ray.origin = (float3)(cos(theta) * scale, 0.0f, sin(theta) * scale);
+    ray.direction = (float3)(sin(theta) * cos(phi), -sin(phi), cos(theta) * cos(phi));
     return ray;
 }
 

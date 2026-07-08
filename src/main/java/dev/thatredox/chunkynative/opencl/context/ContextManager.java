@@ -17,6 +17,12 @@ public class ContextManager {
     public final ClContext context;
     public final Tonemap tonemap;
     public final Renderer renderer;
+    /**
+     * fp64 sample accumulator program. Optional — null if the device doesn't
+     * support cl_khr_fp64 or if the kernel failed to compile. Callers must
+     * fall back to the CPU-blend path in that case.
+     */
+    public final Accumulator accumulator;
 
     public final ClSceneLoader sceneLoader;
 
@@ -32,11 +38,34 @@ public class ContextManager {
     private ContextManager(Device device) {
         this.device = device;
         this.context = new ClContext(device);
-        // Compile both kernels in parallel — they're independent programs
+        // Compile programs in parallel — they're independent.
         CompletableFuture<Tonemap> tonemapFuture = CompletableFuture.supplyAsync(() -> new Tonemap(context));
         CompletableFuture<Renderer> rendererFuture = CompletableFuture.supplyAsync(() -> new Renderer(context));
+        // Accumulator is optional. We try to compile it; if the device
+        // can't handle cl_khr_fp64 or anything else goes wrong, we keep
+        // the renderer alive and fall back to the CPU-blend path.
+        CompletableFuture<Accumulator> accumulatorFuture = CompletableFuture.supplyAsync(() -> {
+            // Skip the build entirely on devices without cl_khr_fp64. Attempting
+            // it just dumps a noisy CL_COMPILE_PROGRAM_FAILURE ("unsupported
+            // OpenCL extension 'cl_khr_fp64'") to the log before we fall back —
+            // detecting the missing extension first keeps the log clean. The CPU
+            // sample-blend path is bit-identical, so there is no quality loss.
+            if (!device.supportsFp64()) {
+                Log.info("ChunkyCL: device lacks cl_khr_fp64; GPU fp64 sample "
+                        + "accumulator disabled, using CPU sample blending.");
+                return null;
+            }
+            try {
+                return new Accumulator(context);
+            } catch (Exception e) {
+                Log.warn("ChunkyCL: GPU fp64 sample accumulator unavailable on this device "
+                        + "(" + e.getMessage() + "). Falling back to CPU sample blending.");
+                return null;
+            }
+        });
         this.tonemap = tonemapFuture.join();
         this.renderer = rendererFuture.join();
+        this.accumulator = accumulatorFuture.join();
         this.sceneLoader = new ClSceneLoader(context);
     }
 
@@ -46,6 +75,8 @@ public class ContextManager {
                 org.jocl.CL.clReleaseProgram(tonemap.simpleFilter);
             if (renderer != null && renderer.kernel != null)
                 org.jocl.CL.clReleaseProgram(renderer.kernel);
+            if (accumulator != null && accumulator.kernel != null)
+                org.jocl.CL.clReleaseProgram(accumulator.kernel);
             if (context != null) {
                 if (context.queue != null)
                     org.jocl.CL.clReleaseCommandQueue(context.queue);
@@ -175,6 +206,20 @@ public class ContextManager {
 
         private Renderer(ClContext context) {
             this.kernel = KernelLoader.loadProgram(context, "kernel", "rayTracer.c");
+        }
+    }
+
+    /**
+     * Optional GPU-side fp64 sample accumulator program. Compiled lazily;
+     * if cl_khr_fp64 isn't supported the program build will fail and
+     * the surrounding ContextManager constructor catches that, leaving
+     * accumulator == null so callers fall back to the CPU-blend path.
+     */
+    public static class Accumulator {
+        public final cl_program kernel;
+
+        private Accumulator(ClContext context) {
+            this.kernel = KernelLoader.loadProgram(context, "kernel", "accumulator.c");
         }
     }
 }

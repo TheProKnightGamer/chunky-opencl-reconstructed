@@ -14,6 +14,21 @@ public abstract class AbstractTextureLoader {
     protected final Reference2ObjectOpenHashMap<Texture, TextureRecord> identityRecordMap;
     protected boolean locked = false;
 
+    /**
+     * Scene animation time at the moment of build, used by exporters to choose
+     * which frame of an animated texture to upload. Set by AbstractSceneLoader
+     * before {@link #build()}.
+     */
+    protected double animationTime = 0;
+
+    public void setAnimationTime(double t) {
+        this.animationTime = t;
+    }
+
+    public double getAnimationTime() {
+        return this.animationTime;
+    }
+
     public AbstractTextureLoader() {
         recordMap = new Object2ObjectOpenCustomHashMap<>(new Hash.Strategy<Texture>() {
             @Override

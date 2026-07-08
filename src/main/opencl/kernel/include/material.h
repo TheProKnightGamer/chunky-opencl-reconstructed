@@ -352,9 +352,13 @@ float3 _Material_specularReflection(IntersectionRecord record, MaterialSample sa
         direction = diffuseDirection + direction * (1 - sample.roughness);
     }
 
-    // Geometric normal correction: prevent reflection from passing through geometry
-    if (signbit(dot(record.geomNormal, direction)) == signbit(dot(record.geomNormal, ray.direction))) {
-        float factor = copysign(dot(record.geomNormal, ray.direction), -EPS - dot(record.geomNormal, direction));
+    // Geometric normal correction: prevent reflection from passing through geometry.
+    // Must use the SAME formula as CPU Ray.specularReflection (and the diffuse
+    // branch below): factor = signum(geomN·ray.d)*(-EPS) - d·geomN. The previous
+    // copysign(dot(geomN,ray.d), ...) form produced a different correction
+    // magnitude, perturbing rough/normal-mapped specular reflections off-parity.
+    if (sign(dot(record.geomNormal, direction)) == sign(dot(record.geomNormal, ray.direction))) {
+        float factor = copysign(1.0f, dot(record.geomNormal, ray.direction)) * (-EPS) - dot(direction, record.geomNormal);
         direction += factor * record.geomNormal;
     }
 
@@ -391,17 +395,29 @@ bool _Material_refract(float3 incident, float3 normal, float n1n2, float3* refra
 // Helper for transmissivity cap redistribution (matches CPU reassignTransmissivity)
 float _Material_reassignTransmissivity(float maxChannel, float targetChannel, float otherChannel,
                                         float shouldTrans, float cap) {
-    // Redistribute excess from maxChannel to targetChannel
-    float excess = maxChannel - cap;
-    float sum = targetChannel + otherChannel;
-    if (sum > EPS) {
-        return targetChannel + excess * (targetChannel / sum);
-    }
-    return targetChannel + excess * 0.5f;
+    // Exact CPU reassignTransmissivity (PathTracer.java): derived to preserve
+    // BOTH the channel ratio and the mean transmission (= shouldTrans). The
+    // previous proportional split did neither, shifting stained-glass hue.
+    // Arg roles map from/to/other/trans/cap = maxChannel/targetChannel/
+    // otherChannel/shouldTrans/cap. (denom = other+to-2*from is <= 0 here since
+    // maxChannel is the largest; it is only 0 if all three are equal, which can't
+    // happen once a channel has exceeded the cap, so no divide-by-zero guard is
+    // needed — matching CPU.)
+    return (cap * (otherChannel - 2.0f * targetChannel + maxChannel)
+            + (3.0f * shouldTrans) * (targetChannel - maxChannel))
+           / (otherChannel + targetChannel - 2.0f * maxChannel);
 }
 
 // Compute fancy translucency transmission spectrum (matches CPU translucentRayColor)
 float3 _Material_fancyTransmissionSpectrum(float4 sampleColor, float pAbsorb, float transmissivityCap) {
+    // KNOWN LIMITATION (accepted): CPU translucentRayColor applies a final
+    // energy-gain clamp (rgbTrans *= nextEnergy/currentEnergy) ONLY when
+    // transmissivityCap > 1, using the transmitted ray's RETURNED color. The GPU
+    // computes this spectrum forward (before the downstream result is known) and
+    // folds it into throughput, so that clamp cannot be expressed here. With the
+    // default cap == 1 the CPU skips the clamp too, so there is NO divergence at
+    // defaults; only a user-raised cap > 1 differs (tinted transmission slightly
+    // brighter on GPU). Left unsupported for exact parity above cap 1.
     float shouldTrans = 1.0f - pAbsorb;
     float colorTrans = (sampleColor.x + sampleColor.y + sampleColor.z) / 3.0f;
     float3 rgbTrans = (float3)(shouldTrans);
@@ -442,15 +458,16 @@ MaterialPdfSample Material_samplePdf(Material self, IntersectionRecord record, M
     float n1 = ray.currentIor;
     float n2 = sample.ior;
 
-    // SSS: chance to sample from back side of surface
-    if (sample.sss && Random_nextFloat(random) < F_SUBSURFACE) {
-        IntersectionRecord flipped = record;
-        flipped.normal = -record.normal;
-        out.direction = _Material_diffuseReflection(flipped, random);
-        out.spectrum = sample.color.xyz;
-        out.specular = false;
-        return out;
-    }
+    // SSS in chunky CPU is ONLY a property of the sun-NEE path, not of the
+    // BRDF sampling — see PathTracer.java:271-276 inside the sun-NEE block,
+    // which optionally allows the shadow ray to pass through to the back
+    // of the surface for translucent materials (leaves, etc.). The CPU's
+    // BRDF bounce is unaffected by SSS. The kernel's sun-NEE block at
+    // rayTracer.c (cachedSunPower section) already mirrors that. We used
+    // to also have a BRDF-side SSS branch here that redirected ~30% of
+    // diffuse bounces to the backside; that was an extra mechanism with
+    // no CPU equivalent, and produced visibly different leaf rendering.
+    // Removed for parity.
 
     if (sample.metalness > 0 && sample.metalness > Random_nextFloat(random)) {
         // Metal reflection (tinted by albedo)
@@ -529,6 +546,18 @@ MaterialPdfSample Material_samplePdf(Material self, IntersectionRecord record, M
                 float n1n2 = n1 / targetIor;
                 float3 refractedDir;
                 if (_Material_refract(ray.direction, record.normal, n1n2, &refractedDir)) {
+                    // Geometric-normal correction (CPU doRefraction): if the
+                    // refracted direction landed on the same side of the geometry
+                    // as the incident ray (sign MISMATCH vs ray dir — note this is
+                    // != , opposite the == used for reflection, because refraction
+                    // crosses the surface), nudge it back through. Prevents the
+                    // refracted ray from re-entering wave-perturbed/normal-mapped
+                    // geometry it just crossed.
+                    if (sign(dot(record.geomNormal, refractedDir)) != sign(dot(record.geomNormal, ray.direction))) {
+                        float factor = copysign(1.0f, dot(record.geomNormal, ray.direction)) * (-EPS) - dot(refractedDir, record.geomNormal);
+                        refractedDir += factor * record.geomNormal;
+                        refractedDir = normalize(refractedDir);
+                    }
                     out.direction = refractedDir;
                     // Fancy translucency breaks at alpha=1 (shouldTrans=0 → black).
                     // Use the normal formula for opaque refractive (spectrum = color),

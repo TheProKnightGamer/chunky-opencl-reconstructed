@@ -167,7 +167,12 @@ bool Cloud_intersect(float cloudHeight, float cloudSize, float cloudOffsetX, flo
     int nx = 0;
     int nz = 0;
     bool hitCell = false;
-    while (t < tExit) {
+    // Iteration cap: the cloud grid wraps every 256 cells, so a ray that hasn't
+    // hit a cloud cell within a couple of full traversals never will. Without it,
+    // an exactly-horizontal ray (tExit ~1e30) with no closer geometry hit would
+    // step cell-by-cell almost forever (GPU hang / TDR).
+    int cloudSteps = 0;
+    while (t < tExit && cloudSteps++ < 2048) {
         if (tMaxX < tMaxZ) {
             ix += stepX;
             t = tMaxX;
@@ -263,11 +268,10 @@ bool closestIntersect(SceneConfig self, image2d_array_t atlas, Ray ray, Intersec
             if (!hit || waterRecord.distance < tempRecord.distance) {
                 tempRecord = waterRecord;
                 FillWaterSample(sample, &self);
-                tempRecord.geomNormal = tempRecord.normal;
-                Water_applyShading(&tempRecord, self.waterShadingStrategy,
-                                   self.animationTime, tempRecord.texCoord.x,
-                                   tempRecord.texCoord.y, self.waterShaderParams,
-                                   self.waterNormalMap, self.waterNormalMapW);
+                // Wave shading is deferred to the unified water-shading block
+                // below (after geomNormal is pinned to the flat normal), so the
+                // flat plane normal survives for the anti-leak corrections
+                // instead of being clobbered by the blanket geomNormal=normal.
                 hit = true;
             }
         }
@@ -284,12 +288,20 @@ bool closestIntersect(SceneConfig self, image2d_array_t atlas, Ray ray, Intersec
     if (record->material >= 0) {
         *mat = Material_get(self.materialPalette, record->material);
     }
-    if (sample->isWater && record->material >= 0) {
-        sample->color.w = self.waterOpacity;
-        if (self.useCustomWaterColor) {
-            sample->color.xyz = self.waterColor;
-            sample->tintType = 0;
+    if (sample->isWater) {
+        // Water BLOCKS (material >= 0) get opacity / custom color applied here;
+        // the water PLANE already did so in FillWaterSample.
+        if (record->material >= 0) {
+            sample->color.w = self.waterOpacity;
+            if (self.useCustomWaterColor) {
+                sample->color.xyz = self.waterColor;
+                sample->tintType = 0;
+            }
         }
+        // Wave shading for BOTH water blocks and the water plane. geomNormal is
+        // pinned to the FLAT surface normal first (line 283 set it), THEN the
+        // shading perturbs record->normal — so the specular/refraction/diffuse
+        // anti-leak corrections run against the true flat normal, not the wave.
         if (record->normal.y != 0.0f) {
             record->geomNormal = record->normal;
             float3 hitPos = ray.origin + ray.direction * record->distance;
@@ -357,6 +369,13 @@ bool previewIntersect(SceneConfig self, image2d_array_t atlas, Ray ray,
             hit = true;
         }
     }
+    // Clouds — the CPU preview (PreviewRayTracer.nextIntersection) renders them too.
+    if (self.cloudsEnabled) {
+        if (Cloud_intersect(self.cloudHeight, self.cloudSize, self.cloudOffsetX, self.cloudOffsetZ,
+                            self.cloudData, ray, &tempRecord, sample, hit)) {
+            hit = true;
+        }
+    }
     if (!hit) return false;
     *record = tempRecord;
     record->geomNormal = record->normal;
@@ -373,14 +392,26 @@ void applyBiomeTint(SceneConfig scene, MaterialSample* sample, float3 hitPos) {
         int bx = (int)floor(hitPos.x);
         int bz = (int)floor(hitPos.z);
         if (bx >= 0 && bx < scene.biomeDataSize && bz >= 0 && bz < scene.biomeDataSize) {
-            // 3D biome lookup: Y level = floor(hitY / 16), clamped to [0, yLevels-1]
-            int yl = clamp((int)floor(hitPos.y) >> 4, 0, scene.biomeYLevels - 1);
-            int idx = (yl * scene.biomeDataSize * scene.biomeDataSize + bz * scene.biomeDataSize + bx) * 4
-                      + (sample->tintType - 1);
-            int packed = scene.biomeData[idx];
-            tintColor.x = (float)((packed >> 16) & 0xFF) / 255.0f;
-            tintColor.y = (float)((packed >> 8) & 0xFF) / 255.0f;
-            tintColor.z = (float)(packed & 0xFF) / 255.0f;
+            // Y interpolation: samples sit at section centers (y mod 16 == 8).
+            // Linearly blend between adjacent sections so 3D biome tints don't
+            // step every 16 blocks vertically.
+            float yIdx = hitPos.y * 0.0625f - 0.5f;
+            int yLo = clamp((int)floor(yIdx), 0, scene.biomeYLevels - 1);
+            int yHi = clamp(yLo + 1, 0, scene.biomeYLevels - 1);
+            float w = clamp(yIdx - (float)yLo, 0.0f, 1.0f);
+
+            int stride = scene.biomeDataSize * scene.biomeDataSize;
+            int base = (bz * scene.biomeDataSize + bx) * 4 + (sample->tintType - 1);
+            int p0 = scene.biomeData[yLo * stride * 4 + base];
+            int p1 = scene.biomeData[yHi * stride * 4 + base];
+
+            float3 c0 = (float3)((float)((p0 >> 16) & 0xFF) / 255.0f,
+                                 (float)((p0 >> 8) & 0xFF) / 255.0f,
+                                 (float)(p0 & 0xFF) / 255.0f);
+            float3 c1 = (float3)((float)((p1 >> 16) & 0xFF) / 255.0f,
+                                 (float)((p1 >> 8) & 0xFF) / 255.0f,
+                                 (float)(p1 & 0xFF) / 255.0f);
+            tintColor = mix(c0, c1, w);
             sample->color.xyz *= tintColor;
             return;
         }

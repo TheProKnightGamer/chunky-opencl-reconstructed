@@ -46,6 +46,27 @@ public class Device {
         return freq * units * simd / 1000.0;
     }
 
+    /**
+     * Whether this device advertises the {@code cl_khr_fp64} extension. The GPU
+     * sample accumulator (accumulator.c) does
+     * {@code #pragma OPENCL EXTENSION cl_khr_fp64 : enable} and uses double
+     * precision; on a device without that extension the pragma is rejected and
+     * the program fails to build with a noisy CL_COMPILE_PROGRAM_FAILURE dump.
+     * Checking up front lets the caller skip the build entirely and fall back to
+     * CPU sample blending silently (no quality loss — the CPU does the same fp64
+     * blend). Note: devices that expose fp64 only via the vendor-specific
+     * {@code cl_amd_fp64} extension are intentionally not matched, because the
+     * accumulator kernel specifically requires the KHR pragma.
+     */
+    public boolean supportsFp64() {
+        try {
+            String extensions = getString(CL_DEVICE_EXTENSIONS);
+            return extensions != null && extensions.contains("cl_khr_fp64");
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
     public enum DeviceType {
         CPU("CPU"), GPU("GPU"), ACCELERATOR("Accelerator"),
         CUSTOM("Custom"), UNKNOWN("Unknown");

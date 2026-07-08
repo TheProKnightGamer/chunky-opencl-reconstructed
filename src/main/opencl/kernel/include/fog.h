@@ -26,7 +26,9 @@ typedef struct {
     float layerDensity[MAX_FOG_LAYERS];
 } FogConfig;
 
-FogConfig Fog_load(__global const float* fogData) {
+// fogData is small (~32 floats, ~128 B) and uniform across all work-items
+// so the kernel passes it via __constant memory for broadcast-cached access.
+FogConfig Fog_load(__constant const float* fogData) {
     FogConfig fog;
     fog.mode = (int)fogData[0];
     fog.uniformDensity = fogData[1];

@@ -29,6 +29,8 @@ public class OpenClPreviewRenderer implements Renderer {
     private volatile ContextManager cachedContext = null;
     private volatile int[] prevCanvasConfig = null;
     private volatile ClIntBuffer cachedCanvasConfig = null;
+    private volatile ClMemory cachedOutputBuffer = null;
+    private volatile int cachedOutputSize = -1;
 
     @Override
     public String getId() {
@@ -55,8 +57,23 @@ public class OpenClPreviewRenderer implements Renderer {
             if (cachedKernel != null) clReleaseKernel(cachedKernel);
             cachedKernel = clCreateKernel(context.renderer.kernel, "preview", null);
             cachedContext = context;
+            // Context change invalidates all GPU resources
+            if (cachedCanvasConfig != null) { cachedCanvasConfig.close(); cachedCanvasConfig = null; }
+            prevCanvasConfig = null;
+            if (cachedOutputBuffer != null) { cachedOutputBuffer.close(); cachedOutputBuffer = null; }
+            cachedOutputSize = -1;
         }
         return cachedKernel;
+    }
+
+    private ClMemory getOutputBuffer(int size, ContextManager context) {
+        if (cachedOutputSize != size) {
+            if (cachedOutputBuffer != null) cachedOutputBuffer.close();
+            cachedOutputBuffer = new ClMemory(clCreateBuffer(context.context.context, CL_MEM_WRITE_ONLY,
+                    (long) Sizeof.cl_int * size, null, null));
+            cachedOutputSize = size;
+        }
+        return cachedOutputBuffer;
     }
 
     private ClIntBuffer getCanvasConfig(Scene scene, ContextManager context) {
@@ -92,16 +109,15 @@ public class OpenClPreviewRenderer implements Renderer {
             ClIntBuffer clCanvasConfig = getCanvasConfig(scene, context);
 
             ClCamera camera = new ClCamera(scene, context.context);
-            ClMemory buffer = new ClMemory(clCreateBuffer(context.context.context, CL_MEM_WRITE_ONLY,
-                    (long) Sizeof.cl_int * imageData.length, null, null));
+            ClMemory buffer = getOutputBuffer(imageData.length, context);
 
-            try (ClCamera ignored1 = camera;
-                 ClMemory ignored2 = buffer) {
+            try (ClCamera ignored1 = camera) {
 
                 // Generate the camera rays
                 camera.generate(null, false);
 
                 renderEvent[0] = new cl_event();
+                try {
 
                 int argIndex = 0;
                 clSetKernelArg(kernel, argIndex++, Sizeof.cl_mem, Pointer.to(camera.projectorType.get()));
@@ -136,6 +152,9 @@ public class OpenClPreviewRenderer implements Renderer {
                 clSetKernelArg(kernel, argIndex++, Sizeof.cl_mem, Pointer.to(sceneLoader.getBiomeData().get()));
                 clSetKernelArg(kernel, argIndex++, Sizeof.cl_int, Pointer.to(new int[] { sceneLoader.getBiomeDataSize() }));
                 clSetKernelArg(kernel, argIndex++, Sizeof.cl_int, Pointer.to(new int[] { sceneLoader.getBiomeYLevels() }));
+                // Cloud config (renderConfig) + cloud bitmap so the preview can render clouds.
+                clSetKernelArg(kernel, argIndex++, Sizeof.cl_mem, Pointer.to(sceneLoader.getRenderConfig().get()));
+                clSetKernelArg(kernel, argIndex++, Sizeof.cl_mem, Pointer.to(sceneLoader.getCloudData().get()));
                 clSetKernelArg(kernel, argIndex++, Sizeof.cl_mem, Pointer.to(buffer.get()));
 
                 try {
@@ -147,16 +166,22 @@ public class OpenClPreviewRenderer implements Renderer {
                             (long) Sizeof.cl_int * imageData.length, Pointer.to(imageData),
                             1, renderEvent, null);
                 } catch (CLException e) {
-                    System.err.println("[ChunkyCL] Preview kernel error: " + e.getMessage());
-                    clReleaseEvent(renderEvent[0]);
+                    se.llbit.log.Log.warn("ChunkyCL: Preview kernel error: " + e.getMessage());
                     return;
                 }
 
                 manager.redrawScreen();
                 postRender.getAsBoolean();
+                } finally {
+                    // Release the event regardless of how we exit the body —
+                    // success, exception during arg setup, exception during
+                    // dispatch/read, or postRender callback throwing.
+                    if (renderEvent[0] != null) {
+                        try { clReleaseEvent(renderEvent[0]); } catch (Exception ignored) {}
+                        renderEvent[0] = null;
+                    }
+                }
             }
-
-            clReleaseEvent(renderEvent[0]);
         } finally {
             if (sceneLock.isHeldByCurrentThread()) {
                 sceneLock.unlock();

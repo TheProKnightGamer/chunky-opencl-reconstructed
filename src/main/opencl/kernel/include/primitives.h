@@ -93,6 +93,15 @@ bool AABB_full_intersect(AABB self, Ray ray, IntersectionRecord* record) {
     if (tmin >= record->distance) {
         return false;
     }
+    // Reject hits at/behind the ray origin (tmin <= OFFSET), matching the floor
+    // Quad/Triangle/Water already use. Without it, a ray that just transmitted
+    // straight through a semi-transparent full-cube texel (slime block, leaf-edge
+    // AA pixel) sits exactly on the entry face, AABB returns tmin~0, and the ray
+    // re-hits the SAME block every step — darkening it and occluding the scene
+    // behind. With the floor, the octree DDA simply marches past the cell.
+    if (tmin <= OFFSET) {
+        return false;
+    }
 
     record->distance = tmin;
 

@@ -5,6 +5,7 @@ import dev.thatredox.chunkynative.opencl.renderer.OpenClPathTracingRenderer;
 import dev.thatredox.chunkynative.opencl.renderer.OpenClPreviewRenderer;
 import dev.thatredox.chunkynative.opencl.renderer.map.GpuMapRenderer;
 import dev.thatredox.chunkynative.opencl.tonemap.ChunkyImposterGpuPostProcessingFilter;
+import dev.thatredox.chunkynative.opencl.tonemap.HableToneMappingImposterGpuPostprocessingFilter;
 import dev.thatredox.chunkynative.opencl.tonemap.UE4ToneMappingImposterGpuPostprocessingFilter;
 import dev.thatredox.chunkynative.opencl.ui.ChunkyClTab;
 import dev.thatredox.chunkynative.opencl.ui.OpenClSettingsLocker;
@@ -14,6 +15,7 @@ import se.llbit.chunky.renderer.scene.SceneFactory;
 import se.llbit.chunky.renderer.DefaultRenderManager;
 import se.llbit.chunky.main.ChunkyOptions;
 import se.llbit.chunky.model.BlockModel;
+import se.llbit.chunky.renderer.postprocessing.HableToneMappingFilter;
 import se.llbit.chunky.renderer.postprocessing.PostProcessingFilters;
 import se.llbit.chunky.renderer.postprocessing.UE4ToneMappingFilter;
 import se.llbit.chunky.ui.ChunkyFx;
@@ -109,7 +111,11 @@ public class ChunkyCl implements Plugin {
         addImposterFilter("GAMMA", ChunkyImposterGpuPostProcessingFilter.Filter.GAMMA);
         addImposterFilter("TONEMAP1", ChunkyImposterGpuPostProcessingFilter.Filter.TONEMAP1);
         addImposterFilter("TONEMAP2", ChunkyImposterGpuPostProcessingFilter.Filter.ACES);
-        addImposterFilter("TONEMAP3", ChunkyImposterGpuPostProcessingFilter.Filter.HABLE);
+
+        // HABLE (TONEMAP3) uses a dedicated kernel so user-configurable Hable
+        // parameters (shoulder/linear/toe/whitepoint) are honored, not hardcoded.
+        PostProcessingFilters.getPostProcessingFilterFromId("TONEMAP3").ifPresent(filter ->
+                PostProcessingFilters.addPostProcessingFilter(new HableToneMappingImposterGpuPostprocessingFilter((HableToneMappingFilter) filter)));
 
         PostProcessingFilters.getPostProcessingFilterFromId("UE4_FILMIC").ifPresent(filter ->
                 PostProcessingFilters.addPostProcessingFilter(new UE4ToneMappingImposterGpuPostprocessingFilter((UE4ToneMappingFilter) filter)));
