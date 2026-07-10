@@ -7,7 +7,7 @@ import org.jocl.cl_mem;
 public class ClMemory implements AutoCloseable {
     protected final NativeCleaner.Cleaner cleaner;
     protected final cl_mem memory;
-    protected boolean valid;
+    protected volatile boolean valid;
 
     public ClMemory(cl_mem memory) {
         this.cleaner = NativeCleaner.INSTANCE.register(this, () -> CL.clReleaseMemObject(memory));
@@ -25,11 +25,13 @@ public class ClMemory implements AutoCloseable {
 
     @Override
     public void close() {
+        // Invalidate before releasing so a concurrent get() can never observe
+        // a valid flag paired with an already-released cl_mem.
+        this.valid = false;
         // Clean native resource and unregister the cleaner to avoid retaining it
         // in the NativeCleaner list (prevents a memory leak when many resources
         // are allocated and closed explicitly).
         this.cleaner.clean();
         NativeCleaner.INSTANCE.unregister(this.cleaner);
-        this.valid = false;
     }
 }

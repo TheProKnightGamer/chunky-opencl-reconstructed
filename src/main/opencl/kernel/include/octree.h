@@ -67,6 +67,8 @@ bool Octree_octreeIntersect(Octree self, image2d_array_t atlas, BlockPalette pal
         }
     }
 
+    const int rootNode = self.treeData[0];
+
     for (int i = 0; i < drawDepth; i++) {
         if (distMarch > record->distance) {
             // There's already been a closer intersection!
@@ -84,7 +86,7 @@ bool Octree_octreeIntersect(Octree self, image2d_array_t atlas, BlockPalette pal
 
         // Read the octree with depth (bounded to prevent hang on corrupted data)
         int level = depth;
-        int data = self.treeData[0];
+        int data = rootNode;
         for (int d = 0; d < depth && data > 0; d++) {
             level--;
             lv = 1 & (bp >> level);
@@ -168,6 +170,8 @@ bool Octree_exitWater(Octree self, image2d_array_t atlas, BlockPalette palette, 
         }
     }
 
+    const int rootNode = self.treeData[0];
+
     for (int i = 0; i < drawDepth; i++) {
         if (distMarch > record->distance) {
             return false;
@@ -184,7 +188,7 @@ bool Octree_exitWater(Octree self, image2d_array_t atlas, BlockPalette palette, 
 
         // Read the octree with depth (bounded to prevent hang on corrupted data)
         int level = depth;
-        int data = self.treeData[0];
+        int data = rootNode;
         for (int d = 0; d < depth && data > 0; d++) {
             level--;
             lv = 1 & (bp >> level);

@@ -76,8 +76,10 @@ bool AABB_full_intersect(AABB self, Ray ray, IntersectionRecord* record) {
     float3 minVals = (float3) (self.xmin, self.ymin, self.zmin);
     float3 maxVals = (float3) (self.xmax, self.ymax, self.zmax);
 
-    float3 t1s = (minVals - ray.origin) / ray.direction;
-    float3 t2s = (maxVals - ray.origin) / ray.direction;
+    // Share one reciprocal instead of six divides, matching AABB_quick_intersect's invDir pattern.
+    float3 invD = 1.0f / ray.direction;
+    float3 t1s = (minVals - ray.origin) * invD;
+    float3 t2s = (maxVals - ray.origin) * invD;
 
     float3 tmins = fmin(t1s, t2s);
     float3 tmaxs = fmax(t1s, t2s);
@@ -137,8 +139,10 @@ bool AABB_full_intersect_map_2(AABB self, Ray ray, IntersectionRecord* record) {
     float3 minVals = (float3) (self.xmin, self.ymin, self.zmin);
     float3 maxVals = (float3) (self.xmax, self.ymax, self.zmax);
 
-    float3 t1s = (minVals - ray.origin) / ray.direction;
-    float3 t2s = (maxVals - ray.origin) / ray.direction;
+    // Share one reciprocal instead of six divides, matching AABB_quick_intersect's invDir pattern.
+    float3 invD = 1.0f / ray.direction;
+    float3 t1s = (minVals - ray.origin) * invD;
+    float3 t2s = (maxVals - ray.origin) * invD;
 
     float3 tmins = fmin(t1s, t2s);
     float3 tmaxs = fmax(t1s, t2s);

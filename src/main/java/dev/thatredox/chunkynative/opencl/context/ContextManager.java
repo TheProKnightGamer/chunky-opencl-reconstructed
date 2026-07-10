@@ -5,8 +5,9 @@ import org.jocl.CLException;
 import org.jocl.cl_program;
 import se.llbit.log.Log;
 
-import java.util.Timer;
-import java.util.TimerTask;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -34,6 +35,8 @@ public class ContextManager {
     private static final AtomicReference<Exception> initError = new AtomicReference<>(null);
     /** Guard: ensures only one init thread is started. */
     private static final AtomicBoolean initStarted = new AtomicBoolean(false);
+    /** Contexts replaced by setDevice(); released by the shutdown hook, not immediately. */
+    private static final List<ContextManager> retired = Collections.synchronizedList(new ArrayList<>());
 
     private ContextManager(Device device) {
         this.device = device;
@@ -94,9 +97,6 @@ public class ContextManager {
      * Kick off background initialization without blocking the caller.
      * Safe to call multiple times — only the first call triggers init.
      * Subsequent calls are no-ops.
-     *
-     * Logs periodic progress to the Chunky log panel so the user always
-     * sees that compilation is happening, even before the render thread starts.
      */
     public static void initAsync() {
         if (instance != null) return;
@@ -105,23 +105,11 @@ public class ContextManager {
         final long startTime = System.currentTimeMillis();
         Log.info("ChunkyCL: Compiling OpenCL kernels...");
 
-        // Timer logs every 3 seconds while compilation is running.
-        // Runs on a daemon thread so it won't prevent JVM shutdown.
-        Timer progressTimer = new Timer("ChunkyCL-CompileProgress", true);
-        progressTimer.scheduleAtFixedRate(new TimerTask() {
-            @Override
-            public void run() {
-                if (instance != null) {
-                    cancel();
-                    return;
-                }
-            }
-        }, 3000, 3000);
-
         // Release OpenCL resources on JVM shutdown
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
             ContextManager mgr = instance;
             if (mgr != null) mgr.close();
+            for (ContextManager r : new ArrayList<>(retired)) r.close();
         }, "ChunkyCL-Shutdown"));
 
         Thread initThread = new Thread(() -> {
@@ -134,7 +122,6 @@ public class ContextManager {
                 initError.set(e);
                 Log.error("ChunkyCL: Background OpenCL initialization failed.", e);
             } finally {
-                progressTimer.cancel();
                 initLatch.countDown();
             }
         }, "ChunkyCL-Init");
@@ -150,6 +137,10 @@ public class ContextManager {
     public static ContextManager get() {
         if (instance != null) return instance;
 
+        // Ensure init was started; otherwise initLatch.await() would block forever.
+        // initAsync() is idempotent, so this is safe if init is already running.
+        if (instance == null) initAsync();
+
         // If async init was started, wait for it
         try {
             initLatch.await();
@@ -163,7 +154,8 @@ public class ContextManager {
             throw new RuntimeException("OpenCL initialization failed", err);
         }
 
-        // Fallback: if initAsync was never called, init synchronously
+        // Fallback: if the init thread died with a non-Exception Throwable (only
+        // Exception is caught there), instance and initError are both null — retry synchronously.
         if (instance == null) {
             synchronized (ContextManager.class) {
                 if (instance == null) {
@@ -178,7 +170,13 @@ public class ContextManager {
         try {
             ContextManager old = instance;
             instance = new ContextManager(device);
-            if (old != null) old.close();
+            // Do NOT release the old context here: render threads capture
+            // ContextManager.get() once and keep enqueueing on the old queue for the
+            // whole render; releasing it now is a use-after-release (driver crash or
+            // CL_INVALID_COMMAND_QUEUE). Retire it instead; it is released by the
+            // shutdown hook. Device switches are rare and user-initiated, so the
+            // retained context is a small, bounded leak.
+            if (old != null) retired.add(old);
         } catch (CLException e) {
             Log.error("Failed to set device", e);
         }

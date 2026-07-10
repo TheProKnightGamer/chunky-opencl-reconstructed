@@ -26,6 +26,10 @@ public class ClContext {
     public final cl_command_queue queue;
     public final cl_device_id[] deviceArray;
 
+    // Hashed into the binary-cache key so changing either invalidates cached binaries.
+    private static final String COMPILE_OPTIONS = "-cl-std=CL1.2 -Werror -cl-mad-enable -cl-no-signed-zeros";
+    private static final String LINK_OPTIONS = "";
+
     public ClContext(Device device) {
         this.device = device;
         this.deviceArray = new cl_device_id[] { device.device };
@@ -144,12 +148,22 @@ public class ClContext {
             // are not NULL. Some drivers (e.g. AMD on certain configs) enforce
             // this strictly and reject empty arrays; others (NVIDIA, Intel
             // typically) accept them. The accumulator program has no #includes,
-            // so we explicitly pass null/0 in that case.
+            // so we explicitly pass null/0 in that case. A CL_INVALID_VALUE with
+            // an empty build log indicates argument validation failed before
+            // compilation.
             int numHeaders = includePrograms.length;
             cl_program[] headersArg = numHeaders == 0 ? null : includePrograms;
             String[] headerNamesArg = numHeaders == 0 ? null : includeNames;
-            int code = clCompileProgram(kernelProgram, 1, deviceArray, "-cl-std=CL1.2 -Werror -cl-mad-enable -cl-no-signed-zeros",
-                    numHeaders, headersArg, headerNamesArg, null, null);
+            int code;
+            try {
+                code = clCompileProgram(kernelProgram, 1, deviceArray, COMPILE_OPTIONS,
+                        numHeaders, headersArg, headerNamesArg, null, null);
+            } catch (CLException e) {
+                // Another thread may have re-enabled JOCL's global exceptions
+                // flag; recover the error code so the diagnostics below run
+                // either way.
+                code = e.getStatus();
+            }
             if (code != CL_SUCCESS) {
                 String error;
                 switch (code) {
@@ -184,27 +198,38 @@ public class ClContext {
                         error = "Code " + code;
                         break;
                 }
-                CL.setExceptionsEnabled(true);
-                Log.error("Failed to build CL program: " + error);
+                Log.error("Failed to build CL program " + kernelName + ": " + error);
 
                 long[] size = new long[1];
                 clGetProgramBuildInfo(kernelProgram, deviceArray[0], CL.CL_PROGRAM_BUILD_LOG, 0, null, size);
 
-                byte[] buffer = new byte[(int)size[0]];
-                clGetProgramBuildInfo(kernelProgram, deviceArray[0], CL.CL_PROGRAM_BUILD_LOG, buffer.length, Pointer.to(buffer), null);
+                String log = "";
+                if (size[0] > 0) {
+                    byte[] buffer = new byte[(int) size[0]];
+                    clGetProgramBuildInfo(kernelProgram, deviceArray[0], CL.CL_PROGRAM_BUILD_LOG, buffer.length, Pointer.to(buffer), null);
+                    log = new String(buffer, 0, buffer.length - 1);
+                }
 
-                throw new RuntimeException("Failed to build CL program with error: " + error + "\n" + new String(buffer, 0, buffer.length-1));
+                throw new RuntimeException("Failed to compile CL program '" + kernelName + "' ("
+                        + numHeaders + " embedded headers): " + error
+                        + (log.isEmpty()
+                                ? " - empty build log; driver rejected clCompileProgram arguments before compiling"
+                                : "\n" + log));
             }
-            CL.setExceptionsEnabled(true);
 
-            linked = clLinkProgram(context, 1, deviceArray, "", 1,
-                    new cl_program[] { kernelProgram }, null, null, null);
+            int[] linkStatus = new int[1];
+            linked = clLinkProgram(context, 1, deviceArray, LINK_OPTIONS, 1,
+                    new cl_program[] { kernelProgram }, null, null, linkStatus);
+            if (linked == null || linkStatus[0] != CL_SUCCESS) {
+                throw new RuntimeException("Failed to link CL program " + kernelName + ": code " + linkStatus[0]);
+            }
 
             // --- Phase 4: Cache the compiled binary ---
             saveBinaryToCache(linked, cacheKey, kernelName);
 
             return linked;
         } finally {
+            CL.setExceptionsEnabled(true);
             // Release the intermediate (un-linked) programs. clLinkProgram
             // produces a fresh cl_program; the inputs are no longer needed.
             // Header programs are also no longer referenced once compile
@@ -228,6 +253,8 @@ public class ClContext {
             digest.update(device.name().getBytes(StandardCharsets.UTF_8));
             digest.update(device.versionString().getBytes(StandardCharsets.UTF_8));
             digest.update(getDriverVersion().getBytes(StandardCharsets.UTF_8));
+            digest.update(COMPILE_OPTIONS.getBytes(StandardCharsets.UTF_8));
+            digest.update(LINK_OPTIONS.getBytes(StandardCharsets.UTF_8));
             for (Map.Entry<String, String> entry : allSources.entrySet()) {
                 digest.update(entry.getKey().getBytes(StandardCharsets.UTF_8));
                 digest.update(entry.getValue().getBytes(StandardCharsets.UTF_8));

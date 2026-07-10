@@ -56,7 +56,18 @@ public class ChunkyCl implements Plugin {
         // A Swing dialog with an indeterminate progress bar is shown while
         // compilation runs on a background thread.  attach() blocks until
         // the context is ready so the renderers never have to wait.
-        compileWithProgressDialog();
+        if (!compileWithProgressDialog()) {
+            Log.error("ChunkyCL disabled: OpenCL initialization failed; falling back to the built-in CPU renderer. Use the OpenCL tab to select a different device (takes effect on restart).");
+            // Still register the OpenCL tab so the device selector remains
+            // available to change the persisted clDevice setting.
+            RenderControlsTabTransformer prevT = chunky.getRenderControlsTabTransformer();
+            chunky.setRenderControlsTabTransformer(tabs -> {
+                List<RenderControlsTab> transformed = new ArrayList<>(prevT.apply(tabs));
+                transformed.add(new ChunkyClTab(chunky.getSceneManager().getScene()));
+                return transformed;
+            });
+            return;
+        }
 
         Chunky.addRenderer(new OpenClPathTracingRenderer());
         Chunky.addPreviewRenderer(new OpenClPreviewRenderer());
@@ -132,8 +143,10 @@ public class ChunkyCl implements Plugin {
      * Show a Swing dialog with an indeterminate progress bar while OpenCL
      * kernels compile.  Blocks the calling thread until compilation finishes.
      * Swing is used because JavaFX has not been initialized at this point.
+     *
+     * @return true if the OpenCL context initialized successfully.
      */
-    private void compileWithProgressDialog() {
+    private boolean compileWithProgressDialog() {
         final long startTime = System.currentTimeMillis();
 
         // Kick off background compilation (sets up Timer-based logging too)
@@ -201,21 +214,23 @@ public class ChunkyCl implements Plugin {
         // Block until compilation finishes (or fails)
         try {
             ContextManager.get();
+            long totalSecs = (System.currentTimeMillis() - startTime) / 1000;
+            Log.info(String.format("ChunkyCL: Compilation finished (%d s). Launching UI...", totalSecs));
+            return true;
         } catch (Exception e) {
-            Log.error("OpenCL compilation failed", e);
+            long totalSecs = (System.currentTimeMillis() - startTime) / 1000;
+            Log.error(String.format("OpenCL compilation failed after %d s", totalSecs), e);
+            return false;
+        } finally {
+            uiTimer.cancel();
+
+            // Tear down the dialog
+            SwingUtilities.invokeLater(() -> {
+                if (dialogRef[0] != null) {
+                    dialogRef[0].dispose();
+                }
+            });
         }
-
-        uiTimer.cancel();
-
-        long totalSecs = (System.currentTimeMillis() - startTime) / 1000;
-        Log.info(String.format("ChunkyCL: Compilation finished (%d s). Launching UI...", totalSecs));
-
-        // Tear down the dialog
-        SwingUtilities.invokeLater(() -> {
-            if (dialogRef[0] != null) {
-                dialogRef[0].dispose();
-            }
-        });
     }
 
     private static void addImposterFilter(String id, ChunkyImposterGpuPostProcessingFilter.Filter f) {

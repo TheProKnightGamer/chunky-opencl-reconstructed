@@ -209,7 +209,7 @@ public abstract class AbstractSceneLoader {
         int[] out = new int[bvh.packed.length];
         for (int i = 0; i < out.length; i += 7) {
             PackedBvhNode node = new PackedBvhNode(bvh.packed, i, bvh.packedPrimitives, texturePalette, materialPalette, trigPalette);
-            System.arraycopy(node.pack().elements(), 0, out, i, 7);
+            System.arraycopy(node.node, 0, out, i, 7);
         }
 
         // The kernel walks BVHs with a fixed-size stack of 32 nodes. Pushes

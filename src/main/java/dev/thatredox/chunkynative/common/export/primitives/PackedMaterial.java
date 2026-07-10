@@ -132,4 +132,30 @@ public class PackedMaterial implements Packer {
         packed.add(this.iorAndFlags);
         return packed;
     }
+
+    @Override
+    public boolean equals(Object o) {
+        if (this == o) return true;
+        if (!(o instanceof PackedMaterial)) return false;
+        PackedMaterial m = (PackedMaterial) o;
+        return hasColorTexture == m.hasColorTexture &&
+               hasNormalEmittanceTexture == m.hasNormalEmittanceTexture &&
+               hasSpecularMetalnessRoughnessTexture == m.hasSpecularMetalnessRoughnessTexture &&
+               blockTint == m.blockTint &&
+               colorTexture == m.colorTexture &&
+               normalEmittanceTexture == m.normalEmittanceTexture &&
+               specularMetalnessRoughnessTexture == m.specularMetalnessRoughnessTexture &&
+               iorAndFlags == m.iorAndFlags;
+    }
+
+    @Override
+    public int hashCode() {
+        int h = Long.hashCode(colorTexture);
+        h = 31 * h + blockTint;
+        h = 31 * h + normalEmittanceTexture;
+        h = 31 * h + specularMetalnessRoughnessTexture;
+        h = 31 * h + iorAndFlags;
+        h = 31 * h + ((hasColorTexture ? 4 : 0) | (hasNormalEmittanceTexture ? 2 : 0) | (hasSpecularMetalnessRoughnessTexture ? 1 : 0));
+        return h;
+    }
 }

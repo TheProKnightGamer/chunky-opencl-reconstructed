@@ -4,6 +4,7 @@ import dev.thatredox.chunkynative.opencl.renderer.export.textureexporter.Texture
 import it.unimi.dsi.fastutil.Hash;
 import it.unimi.dsi.fastutil.objects.Object2ObjectMap;
 import it.unimi.dsi.fastutil.objects.Object2ObjectOpenCustomHashMap;
+import it.unimi.dsi.fastutil.objects.Reference2IntOpenHashMap;
 import it.unimi.dsi.fastutil.objects.Reference2ObjectOpenHashMap;
 import se.llbit.chunky.resources.Texture;
 
@@ -31,9 +32,19 @@ public abstract class AbstractTextureLoader {
 
     public AbstractTextureLoader() {
         recordMap = new Object2ObjectOpenCustomHashMap<>(new Hash.Strategy<Texture>() {
+            // Content hashes are expensive (full pixel-array hash; sign textures render
+            // their whole bitmap just to be hashed) and fastutil recomputes them on every
+            // rehash and on every lookup past the identity cache in get(). Texture contents
+            // are stable for the lifetime of this loader (a fresh loader is created per
+            // repack, see AbstractSceneLoader), so memoize by instance identity.
+            private final Reference2IntOpenHashMap<Texture> hashCache = new Reference2IntOpenHashMap<>();
+
             @Override
             public int hashCode(Texture o) {
-                return TextureExporter.hashCode(o);
+                if (hashCache.containsKey(o)) return hashCache.getInt(o);
+                int h = TextureExporter.hashCode(o);
+                hashCache.put(o, h);
+                return h;
             }
 
             @Override
