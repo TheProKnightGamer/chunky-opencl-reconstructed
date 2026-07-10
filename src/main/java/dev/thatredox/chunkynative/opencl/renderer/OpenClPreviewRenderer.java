@@ -32,6 +32,18 @@ public class OpenClPreviewRenderer implements Renderer {
     private volatile ClMemory cachedOutputBuffer = null;
     private volatile int cachedOutputSize = -1;
 
+    // Reusable scratch for clSetKernelArg(int) calls. Avoids allocating a new
+    // int[1] + Pointer per arg per render(). clSetKernelArg copies the value
+    // synchronously so the same scratch can serve every int arg, written and
+    // forgotten in sequence.
+    private final int[] argIntScratch = new int[1];
+    private final Pointer argIntScratchPtr = Pointer.to(argIntScratch);
+
+    private void setIntKernelArg(cl_kernel kernel, int idx, int value) {
+        argIntScratch[0] = value;
+        clSetKernelArg(kernel, idx, Sizeof.cl_int, argIntScratchPtr);
+    }
+
     @Override
     public String getId() {
         return "ChunkyClPreviewRenderer";
@@ -95,7 +107,6 @@ public class OpenClPreviewRenderer implements Renderer {
         ContextManager context = ContextManager.get();
         ClSceneLoader sceneLoader = context.sceneLoader;
 
-        cl_event[] renderEvent = new cl_event[1];
         Scene scene = manager.bufferedScene;
         int[] imageData = scene.getBackBuffer().data;
 
@@ -108,16 +119,13 @@ public class OpenClPreviewRenderer implements Renderer {
             cl_kernel kernel = getPreviewKernel(context);
             ClIntBuffer clCanvasConfig = getCanvasConfig(scene, context);
 
-            ClCamera camera = new ClCamera(scene, context.context);
+            ClCamera camera = new ClCamera(scene, context.context, false);
             ClMemory buffer = getOutputBuffer(imageData.length, context);
 
             try (ClCamera ignored1 = camera) {
 
                 // Generate the camera rays
                 camera.generate(null, false);
-
-                renderEvent[0] = new cl_event();
-                try {
 
                 int argIndex = 0;
                 clSetKernelArg(kernel, argIndex++, Sizeof.cl_mem, Pointer.to(camera.projectorType.get()));
@@ -148,10 +156,10 @@ public class OpenClPreviewRenderer implements Renderer {
                 // New: water config for preview
                 clSetKernelArg(kernel, argIndex++, Sizeof.cl_mem, Pointer.to(sceneLoader.getWaterConfig().get()));
                 clSetKernelArg(kernel, argIndex++, Sizeof.cl_mem, Pointer.to(sceneLoader.getChunkBitmap().get()));
-                clSetKernelArg(kernel, argIndex++, Sizeof.cl_int, Pointer.to(new int[] { sceneLoader.getChunkBitmapSize() }));
+                setIntKernelArg(kernel, argIndex++, sceneLoader.getChunkBitmapSize());
                 clSetKernelArg(kernel, argIndex++, Sizeof.cl_mem, Pointer.to(sceneLoader.getBiomeData().get()));
-                clSetKernelArg(kernel, argIndex++, Sizeof.cl_int, Pointer.to(new int[] { sceneLoader.getBiomeDataSize() }));
-                clSetKernelArg(kernel, argIndex++, Sizeof.cl_int, Pointer.to(new int[] { sceneLoader.getBiomeYLevels() }));
+                setIntKernelArg(kernel, argIndex++, sceneLoader.getBiomeDataSize());
+                setIntKernelArg(kernel, argIndex++, sceneLoader.getBiomeYLevels());
                 // Cloud config (renderConfig) + cloud bitmap so the preview can render clouds.
                 clSetKernelArg(kernel, argIndex++, Sizeof.cl_mem, Pointer.to(sceneLoader.getRenderConfig().get()));
                 clSetKernelArg(kernel, argIndex++, Sizeof.cl_mem, Pointer.to(sceneLoader.getCloudData().get()));
@@ -159,12 +167,13 @@ public class OpenClPreviewRenderer implements Renderer {
 
                 try {
                     clEnqueueNDRangeKernel(context.context.queue, kernel, 1, null,
-                            new long[]{imageData.length}, null, 0, null,
-                            renderEvent[0]);
+                            new long[]{imageData.length}, null, 0, null, null);
 
+                    // No event needed: the queue is in-order, so this blocking
+                    // read already waits for the kernel enqueued above.
                     clEnqueueReadBuffer(context.context.queue, buffer.get(), CL_TRUE, 0,
                             (long) Sizeof.cl_int * imageData.length, Pointer.to(imageData),
-                            1, renderEvent, null);
+                            0, null, null);
                 } catch (CLException e) {
                     se.llbit.log.Log.warn("ChunkyCL: Preview kernel error: " + e.getMessage());
                     return;
@@ -172,15 +181,6 @@ public class OpenClPreviewRenderer implements Renderer {
 
                 manager.redrawScreen();
                 postRender.getAsBoolean();
-                } finally {
-                    // Release the event regardless of how we exit the body —
-                    // success, exception during arg setup, exception during
-                    // dispatch/read, or postRender callback throwing.
-                    if (renderEvent[0] != null) {
-                        try { clReleaseEvent(renderEvent[0]); } catch (Exception ignored) {}
-                        renderEvent[0] = null;
-                    }
-                }
             }
         } finally {
             if (sceneLock.isHeldByCurrentThread()) {

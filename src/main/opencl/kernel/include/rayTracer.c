@@ -10,9 +10,15 @@
 #include "fog.h"
 #include "water.h"
 
-// Check if a ray origin is inside water, matching CPU Scene.isInWater().
-// Checks water plane first, then the water octree.
-bool isInWater(SceneConfig scene, float3 origin) {
+// Like isInWater(), but also returns the water-octree block at floor(origin)
+// via *outBlock (0 if empty/out of bounds), so getDirectLightAttenuation can
+// set shadow.material without a second octree descent.
+bool isInWaterWithBlock(SceneConfig scene, float3 origin, int* outBlock) {
+    int x = (int)floor(origin.x);
+    int y = (int)floor(origin.y);
+    int z = (int)floor(origin.z);
+    int waterBlock = Octree_get(&scene.waterOctree, x, y, z);
+    *outBlock = waterBlock;
     // Water plane check
     if (scene.waterPlaneEnabled && origin.y < scene.waterPlaneHeight) {
         if (scene.waterPlaneChunkClip && scene.chunkBitmapSize > 0) {
@@ -33,10 +39,6 @@ bool isInWater(SceneConfig scene, float3 origin) {
         }
     }
     // Water octree check
-    int x = (int)floor(origin.x);
-    int y = (int)floor(origin.y);
-    int z = (int)floor(origin.z);
-    int waterBlock = Octree_get(&scene.waterOctree, x, y, z);
     if (waterBlock == 0) return false;
     int modelType = scene.blockPalette.blockPalette[waterBlock + 0];
     if (modelType != 5) return false;
@@ -46,6 +48,13 @@ bool isInWater(SceneConfig scene, float3 origin) {
     if (isFull) return true;
     float fracY = origin.y - (float)y;
     return fracY < 0.875f; // 14/16 = standard water height
+}
+
+// Check if a ray origin is inside water, matching CPU Scene.isInWater().
+// Checks water plane first, then the water octree.
+bool isInWater(SceneConfig scene, float3 origin) {
+    int unusedBlock;
+    return isInWaterWithBlock(scene, origin, &unusedBlock);
 }
 
 // Sun sampling strategies
@@ -194,17 +203,14 @@ float3 getDirectLightAttenuation(
     shadow.flags = RAY_SHADOW;
     shadow.currentIor = AIR_IOR;
     shadow.prevIor = AIR_IOR;
-    shadow.inWater = isInWater(scene, origin);
+    int wBlock;
+    shadow.inWater = isInWaterWithBlock(scene, origin, &wBlock);
     if (shadow.inWater) {
         shadow.currentIor = scene.waterIor;
         // Set material to the water block data so the world octree skips internal
         // water blocks. Without this, the shadow ray hits every water block boundary
         // (full AABB faces), toggling inWater on each hit and never reaching the
         // actual water surface — resulting in almost no water fog attenuation.
-        int wx = (int)floor(origin.x);
-        int wy = (int)floor(origin.y);
-        int wz = (int)floor(origin.z);
-        int wBlock = Octree_get(&scene.waterOctree, wx, wy, wz);
         if (wBlock > 0) {
             shadow.material = wBlock;
         }
@@ -226,12 +232,6 @@ float3 getDirectLightAttenuation(
             break; // Clear path to sun
         }
 
-        // Apply biome tinting for shadow ray materials (e.g. leaves)
-        {
-            float3 sHitPos = shadow.origin + shadow.direction * srec.distance;
-            applyBiomeTint(scene, &sMat, sHitPos);
-        }
-
         if (srec.distance >= maxDist - OFFSET) {
             break; // Past the target distance
         }
@@ -239,6 +239,14 @@ float3 getDirectLightAttenuation(
         // Opaque material blocks the sun
         if (sMat.color.w > 1.0f - EPS && !sMat.refractive) {
             return (float3)(0.0f);
+        }
+
+        // Apply biome tinting for shadow ray materials (e.g. leaves).
+        // Tint only affects rgb, which is consumed solely by the attenuation
+        // update below — so it can safely run after the break/opaque exits.
+        {
+            float3 sHitPos = shadow.origin + shadow.direction * srec.distance;
+            applyBiomeTint(scene, &sMat, sHitPos);
         }
 
         // CPU formula: per-channel attenuation with alpha tracking

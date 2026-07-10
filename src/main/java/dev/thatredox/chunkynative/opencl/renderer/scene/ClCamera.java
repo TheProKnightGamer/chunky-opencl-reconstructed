@@ -40,6 +40,18 @@ public class ClCamera implements AutoCloseable {
 
 
     public ClCamera(Scene scene, ClContext context) {
+        this(scene, context, true);
+    }
+
+    /**
+     * @param loadApertureMask if false, skip loading a CUSTOM aperture mask from
+     *                         disk. Used by the preview renderer, whose kernel
+     *                         never binds the mask: with a null mask the kernel
+     *                         falls back to the same circle sampling a failed
+     *                         load would produce, so output is identical while
+     *                         avoiding a disk read + decode + GPU upload per frame.
+     */
+    public ClCamera(Scene scene, ClContext context, boolean loadApertureMask) {
         this.scene = scene;
         this.context = context;
         Camera camera = scene.camera();
@@ -74,7 +86,7 @@ public class ClCamera implements AutoCloseable {
         // Load custom aperture mask if needed
         apertureMaskBuffer = null;
         apertureMaskWidth = 0;
-        if (shape == ApertureShape.CUSTOM) {
+        if (loadApertureMask && shape == ApertureShape.CUSTOM) {
             try {
                 String filename = Reflection.getFieldValueNullable(camera, "apertureMaskFilename", String.class);
                 if (filename != null && !filename.isEmpty()) {

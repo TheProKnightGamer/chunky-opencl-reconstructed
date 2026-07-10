@@ -177,8 +177,10 @@ float3 _Material_diffuseReflection(IntersectionRecord record, Random random) {
     float r = sqrt(x1);
     float theta = 2 * M_PI_F * x2;
 
-    float tx = r * cos(theta);
-    float ty = r * sin(theta);
+    float cosT;
+    float sinT = sincos(theta, &cosT);
+    float tx = r * cosT;
+    float ty = r * sinT;
     float tz = sqrt(1 - x1);
 
     // Transform from tangent space to world space
@@ -243,8 +245,10 @@ DiffuseISResult _Material_diffuseReflectionIS(IntersectionRecord record, float3 
     float r = sqrt(x1);
     float theta = 2.0f * M_PI_F * x2;
 
-    float tx = r * cos(theta);
-    float ty = r * sin(theta);
+    float cosT, sinT;
+    sinT = sincos(theta, &cosT);
+    float tx = r * cosT;
+    float ty = r * sinT;
 
     // Build tangent space basis (same as _Material_diffuseReflection)
     float3 normal = record.normal;
@@ -313,8 +317,9 @@ DiffuseISResult _Material_diffuseReflectionIS(IntersectionRecord record, float3 
                 // Sun sampling within rectangular segment
                 r = sqrt(minr * minr * x1 + maxr * maxr * (1.0f - x1));
                 theta = sun_theta + (2.0f * x2 - 1.0f) * circle_radius;
-                tx = r * cos(theta);
-                ty = r * sin(theta);
+                sinT = sincos(theta, &cosT);
+                tx = r * cosT;
+                ty = r * sinT;
                 result.throughputScale = segment_area_proportion / sample_chance;
             } else {
                 // Non-sun sampling: rejection sample outside segment
@@ -325,8 +330,9 @@ DiffuseISResult _Material_diffuseReflectionIS(IntersectionRecord record, float3 
                     r = sqrt(x1);
                     theta = 2.0f * M_PI_F * x2;
                 }
-                tx = r * cos(theta);
-                ty = r * sin(theta);
+                sinT = sincos(theta, &cosT);
+                tx = r * cosT;
+                ty = r * sinT;
                 result.throughputScale = (1.0f - segment_area_proportion) / (1.0f - sample_chance);
             }
         }
@@ -485,16 +491,19 @@ MaterialPdfSample Material_samplePdf(Material self, IntersectionRecord record, M
         return out;
     }
 
-    // Compute pDiffuse and pAbsorb for translucency
+    // Compute pDiffuse and pAbsorb for translucency.
+    // NOTE: the fancy (pow-based) values are only consumed on the
+    // refractive/water path (line ~508) and the alpha<1 transmit path
+    // (line ~512); this guard must stay the exact union of those consumer
+    // conditions. For opaque non-refractive hits the values are dead, so
+    // we skip the transcendental and leave the plain-alpha defaults.
     float alpha = sample.color.w;
-    float pDiffuse, pAbsorb;
-    if (fancierTranslucency) {
+    float pDiffuse = alpha;
+    float pAbsorb = alpha;
+    if (fancierTranslucency && (sample.refractive || sample.isWater || alpha < 1.0f - EPS)) {
         float maxRGB = fmax(sample.color.x, fmax(sample.color.y, sample.color.z));
         pDiffuse = 1.0f - pow(1.0f - alpha, maxRGB);
         pAbsorb = clamp(1.0f - (1.0f - alpha) / (1.0f - pDiffuse + EPS), 0.0f, 1.0f);
-    } else {
-        pDiffuse = alpha;
-        pAbsorb = alpha;
     }
 
     // Refractive/transparent materials: glass, stained glass, water blocks, water plane

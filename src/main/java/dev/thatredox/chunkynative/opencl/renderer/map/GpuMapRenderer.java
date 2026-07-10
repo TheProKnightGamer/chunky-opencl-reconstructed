@@ -55,6 +55,10 @@ public class GpuMapRenderer {
     private int lastSrcSize;
     private int lastDstSize;
     private WritableImage gpuImage;
+    // Host-side destination scratch reused across frames to avoid a view-sized
+    // allocation per map repaint. Safe: all access is on the FX thread, the
+    // blocking read fully overwrites it, and the caller's setPixels copies it.
+    private int[] dstScratch;
 
     // Dedicated command queue: this code runs on the JavaFX Application Thread,
     // so it must NOT share the render thread's queue (concurrent host access to
@@ -313,10 +317,12 @@ public class GpuMapRenderer {
                     null, new long[]{dstSize}, null, 0, null, null);
 
             // Blocking read – waits for kernel to finish
-            int[] dst = new int[dstSize];
+            if (dstScratch == null || dstScratch.length != dstSize) {
+                dstScratch = new int[dstSize];
+            }
             clEnqueueReadBuffer(mapQueue, gpuDstBuffer, CL_TRUE, 0,
-                    (long) Sizeof.cl_int * dstSize, Pointer.to(dst), 0, null, null);
-            return dst;
+                    (long) Sizeof.cl_int * dstSize, Pointer.to(dstScratch), 0, null, null);
+            return dstScratch;
 
         } catch (Exception e) {
             Log.warn("ChunkyCL: GPU mapScale kernel failed; this frame will fall back to CPU", e);
@@ -330,6 +336,7 @@ public class GpuMapRenderer {
         if (gpuSrcBuffer != null) { clReleaseMemObject(gpuSrcBuffer); gpuSrcBuffer = null; }
         if (gpuDstBuffer != null) { clReleaseMemObject(gpuDstBuffer); gpuDstBuffer = null; }
         if (mapQueue != null) { clReleaseCommandQueue(mapQueue); mapQueue = null; }
+        dstScratch = null;
         lastSrcSize = 0;
         lastDstSize = 0;
     }

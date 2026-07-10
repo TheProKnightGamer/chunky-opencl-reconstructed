@@ -227,6 +227,8 @@ bool Cloud_intersect(float cloudHeight, float cloudSize, float cloudOffsetX, flo
     return false;
 }
 
+// NOTE: `mat` is NEVER written and must not be read by callers. Its only
+// consumer was Material_samplePdf's `self` parameter, which is unused.
 bool closestIntersect(SceneConfig self, image2d_array_t atlas, Ray ray, IntersectionRecord* record, MaterialSample* sample, Material* mat) {
     IntersectionRecord tempRecord = *record;
     bool hit = false;
@@ -285,9 +287,6 @@ bool closestIntersect(SceneConfig self, image2d_array_t atlas, Ray ray, Intersec
     if (!hit) return false;
     *record = tempRecord;
     record->geomNormal = record->normal;
-    if (record->material >= 0) {
-        *mat = Material_get(self.materialPalette, record->material);
-    }
     if (sample->isWater) {
         // Water BLOCKS (material >= 0) get opacity / custom color applied here;
         // the water PLANE already did so in FillWaterSample.
@@ -302,7 +301,14 @@ bool closestIntersect(SceneConfig self, image2d_array_t atlas, Ray ray, Intersec
         // pinned to the FLAT surface normal first (line 283 set it), THEN the
         // shading perturbs record->normal — so the specular/refraction/diffuse
         // anti-leak corrections run against the true flat normal, not the wave.
-        if (record->normal.y != 0.0f) {
+        // Shadow rays skip wave shading: CPU traces both sun-NEE
+        // (PathTracer.getDirectLightAttenuation) and emitter-NEE
+        // (sampleEmitterFace) shadow rays with PreviewRayTracer, which never
+        // applies water shading. Sun/fog attenuation reads only distance +
+        // material sample; emitter NEE reads srec.normal only when the hit
+        // grazes the emitter face within 1e-4, where CPU uses the flat normal
+        // anyway.
+        if (record->normal.y != 0.0f && !(ray.flags & RAY_SHADOW)) {
             record->geomNormal = record->normal;
             float3 hitPos = ray.origin + ray.direction * record->distance;
             Water_applyShading(record, self.waterShadingStrategy,
@@ -319,6 +325,8 @@ bool closestIntersect(SceneConfig self, image2d_array_t atlas, Ray ray, Intersec
 // - Tests water octree with per-corner heights (covers loaded chunks)
 // - Uses Octree_exitWater when ray is underwater, matching main renderer
 // - No Water_applyShading, no cloud intersection
+// NOTE: `mat` is NEVER written and must not be read by callers. Its only
+// consumer was Material_samplePdf's `self` parameter, which is unused.
 bool previewIntersect(SceneConfig self, image2d_array_t atlas, Ray ray,
                       IntersectionRecord* record, MaterialSample* sample, Material* mat) {
     IntersectionRecord tempRecord = *record;
@@ -379,9 +387,6 @@ bool previewIntersect(SceneConfig self, image2d_array_t atlas, Ray ray,
     if (!hit) return false;
     *record = tempRecord;
     record->geomNormal = record->normal;
-    if (record->material >= 0) {
-        *mat = Material_get(self.materialPalette, record->material);
-    }
     return true;
 }
 

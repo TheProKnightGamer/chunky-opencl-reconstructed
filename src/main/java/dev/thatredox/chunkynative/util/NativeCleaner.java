@@ -1,11 +1,14 @@
 package dev.thatredox.chunkynative.util;
 
+import se.llbit.log.Log;
+
 import java.lang.ref.PhantomReference;
 import java.lang.ref.Reference;
 import java.lang.ref.ReferenceQueue;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 public class NativeCleaner extends Thread {
     public static final NativeCleaner INSTANCE = new NativeCleaner("Chunky Native Cleaner");
@@ -15,7 +18,7 @@ public class NativeCleaner extends Thread {
 
     public static class Cleaner extends PhantomReference<Object> {
         protected final Runnable action;
-        protected volatile boolean cleaned = false;
+        private final AtomicBoolean cleaned = new AtomicBoolean(false);
 
         protected Cleaner(Object ref, ReferenceQueue<Object> q, Runnable action) {
             super(ref, q);
@@ -23,8 +26,7 @@ public class NativeCleaner extends Thread {
         }
 
         public void clean() {
-            if (!cleaned) {
-                cleaned = true;
+            if (cleaned.compareAndSet(false, true)) {
                 action.run();
             }
         }
@@ -56,7 +58,11 @@ public class NativeCleaner extends Thread {
             while (!interrupted()) {
                 Reference<?> cleaner = cleanerQueue.remove();
                 if (cleaner instanceof Cleaner) {
-                    ((Cleaner) cleaner).clean();
+                    try {
+                        ((Cleaner) cleaner).clean();
+                    } catch (Throwable t) {
+                        Log.warn("Native resource cleanup failed", t);
+                    }
                     this.cleaners.remove(cleaner);
                 }
             }

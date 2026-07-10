@@ -33,7 +33,7 @@ float idouble_to_float(imposter_double value) {
             return NAN;
         }
     } else {
-        return sign * ldexp(1 + ((float) mantissa / (1ull << 52)), exponent - 1023);
+        return sign * ldexp(1 + ((float) mantissa / (1ull << 52)), (int) exponent - 1023);
     }
 #endif
 }

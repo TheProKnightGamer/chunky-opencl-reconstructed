@@ -16,7 +16,6 @@ import java.nio.ByteOrder;
 import java.nio.FloatBuffer;
 import java.util.Arrays;
 import java.util.Random;
-import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.BooleanSupplier;
 import java.util.stream.IntStream;
 
@@ -135,7 +134,6 @@ public class OpenClPathTracingRenderer implements Renderer {
     public void render(DefaultRenderManager manager) throws InterruptedException {
         ContextManager context = ContextManager.get();
         ClSceneLoader sceneLoader = context.sceneLoader;
-        ReentrantLock renderLock = new ReentrantLock();
         Scene scene = manager.bufferedScene;
         double[] sampleBuffer = scene.getSampleBuffer();
         int pixelCount = sampleBuffer.length / 3;
@@ -261,7 +259,8 @@ public class OpenClPathTracingRenderer implements Renderer {
         // Camera must be per-render (changes with each scene)
         ClCamera camera = new ClCamera(scene, context.context);
         try {
-            camera.generate(renderLock, true);
+            // render() runs entirely on this thread, so no lock is passed to ClCamera.generate.
+            camera.generate(null, true);
             int argIndex = 0;
             clSetKernelArg(kernel, argIndex++, Sizeof.cl_mem, Pointer.to(camera.projectorType.get()));
             clSetKernelArg(kernel, argIndex++, Sizeof.cl_mem, Pointer.to(camera.cameraSettings.get()));
@@ -471,13 +470,29 @@ public class OpenClPathTracingRenderer implements Renderer {
                 // (typically every 100 ms - 2 s, vs. the old per-iteration
                 // 32 MB readback at potentially 100+ Hz).
                 //
-                // Initial state: upload current sampleBuffer to accumulator
-                // so resumed renders pick up where they left off. The upload
-                // is a single blocking write per render() call (50 MB at
-                // 1080p, ~4 ms over PCIe).
+                // Initial state: seed the accumulator. For a fresh render
+                // (committedSpp == 0) the first accumulate pass runs with
+                // prevWeight == 0.0, so the accumulator's prior contents are
+                // irrelevant — a non-blocking GPU-side zero fill replaces the
+                // blocking host upload (50 MB at 1080p, ~800 MB at 8K).
+                // clEnqueueFillBuffer is core OpenCL 1.2, guaranteed present
+                // because this path only runs when the accumulator program
+                // built via the 1.2-only clCompileProgram/clLinkProgram.
+                // Resumed renders (spp > 0) still upload sampleBuffer so they
+                // pick up where they left off. The targetSpp > 0 guard keeps
+                // the upload in the degenerate case where the loop below never
+                // runs and the final readback would otherwise replace
+                // sampleBuffer's contents with zeros instead of round-tripping
+                // them.
                 long accBytes = (long) Sizeof.cl_double * pixelCount * 3;
-                clEnqueueWriteBuffer(context.context.queue, cachedAccumulator.get(),
-                        CL_TRUE, 0, accBytes, Pointer.to(sampleBuffer), 0, null, null);
+                if (committedSpp == 0 && scene.getTargetSpp() > 0) {
+                    clEnqueueFillBuffer(context.context.queue, cachedAccumulator.get(),
+                            Pointer.to(new double[]{0.0}), Sizeof.cl_double,
+                            0, accBytes, 0, null, null);
+                } else {
+                    clEnqueueWriteBuffer(context.context.queue, cachedAccumulator.get(),
+                            CL_TRUE, 0, accBytes, Pointer.to(sampleBuffer), 0, null, null);
+                }
 
                 // Bind the kernel-arg slots that don't change per iteration.
                 // Slots 2/3 (weights) are set inside the loop.
@@ -490,48 +505,43 @@ public class OpenClPathTracingRenderer implements Renderer {
                 final double[] weightScratch = new double[1];
 
                 while (scene.spp < scene.getTargetSpp()) {
-                    renderLock.lock();
-                    try {
-                        cfg[0] = rand.nextInt();
-                        cfg[1] = 0;
-                        cfg[2] = scene.getEmittersEnabled() ? 1 : 0;
-                        cfg[3] = scene.getEmitterSamplingStrategy().ordinal();
-                        cfg[4] = Math.max(1, scene.getCurrentBranchCount());
-                        clEnqueueWriteBuffer(context.context.queue, dynamicConfig.get(), CL_TRUE, 0,
-                                Sizeof.cl_int * cfg.length, cfgPtr, 0, null, null);
-                        float curEmitterIntensity = (float) scene.getEmitterIntensity();
-                        if (curEmitterIntensity != lastEmitterIntensity) {
-                            lastEmitterIntensity = curEmitterIntensity;
-                            emitterIntensityArr[0] = curEmitterIntensity;
-                            clEnqueueWriteBuffer(context.context.queue, emitterIntensityMem.get(), CL_TRUE, 0,
-                                    Sizeof.cl_float, emitterIntensityPtr, 0, null, null);
-                        }
-                        // Path-trace this pass into the single fp32 buffer.
-                        clEnqueueNDRangeKernel(context.context.queue, kernel, 1,
-                                null, dispatchGlobal, null, 0, null, null);
-
-                        int passSpp = iterationsPerLaunch * Math.max(1, scene.getCurrentBranchCount());
-                        // Weights computed in fp64 the same way as the CPU loop:
-                        //   prevWeight = committedSpp / (committedSpp + passSpp)
-                        //   passWeight = passSpp     / (committedSpp + passSpp)
-                        long total = (long) committedSpp + (long) passSpp;
-                        double prevWeight = (double) committedSpp / (double) total;
-                        double passWeight = (double) passSpp     / (double) total;
-
-                        weightScratch[0] = prevWeight;
-                        clSetKernelArg(cachedAccumulateKernel, 2, Sizeof.cl_double, Pointer.to(weightScratch));
-                        weightScratch[0] = passWeight;
-                        clSetKernelArg(cachedAccumulateKernel, 3, Sizeof.cl_double, Pointer.to(weightScratch));
-
-                        clEnqueueNDRangeKernel(context.context.queue, cachedAccumulateKernel, 1,
-                                null, accumulateGlobal, null, 0, null, null);
-
-                        committedSpp = (int) Math.min((long) Integer.MAX_VALUE, total);
-                        scene.spp = committedSpp;
-                        sppSinceRedraw += passSpp;
-                    } finally {
-                        renderLock.unlock();
+                    cfg[0] = rand.nextInt();
+                    cfg[1] = 0;
+                    cfg[2] = scene.getEmittersEnabled() ? 1 : 0;
+                    cfg[3] = scene.getEmitterSamplingStrategy().ordinal();
+                    cfg[4] = Math.max(1, scene.getCurrentBranchCount());
+                    clEnqueueWriteBuffer(context.context.queue, dynamicConfig.get(), CL_TRUE, 0,
+                            Sizeof.cl_int * cfg.length, cfgPtr, 0, null, null);
+                    float curEmitterIntensity = (float) scene.getEmitterIntensity();
+                    if (curEmitterIntensity != lastEmitterIntensity) {
+                        lastEmitterIntensity = curEmitterIntensity;
+                        emitterIntensityArr[0] = curEmitterIntensity;
+                        clEnqueueWriteBuffer(context.context.queue, emitterIntensityMem.get(), CL_TRUE, 0,
+                                Sizeof.cl_float, emitterIntensityPtr, 0, null, null);
                     }
+                    // Path-trace this pass into the single fp32 buffer.
+                    clEnqueueNDRangeKernel(context.context.queue, kernel, 1,
+                            null, dispatchGlobal, null, 0, null, null);
+
+                    int passSpp = iterationsPerLaunch * Math.max(1, scene.getCurrentBranchCount());
+                    // Weights computed in fp64 the same way as the CPU loop:
+                    //   prevWeight = committedSpp / (committedSpp + passSpp)
+                    //   passWeight = passSpp     / (committedSpp + passSpp)
+                    long total = (long) committedSpp + (long) passSpp;
+                    double prevWeight = (double) committedSpp / (double) total;
+                    double passWeight = (double) passSpp     / (double) total;
+
+                    weightScratch[0] = prevWeight;
+                    clSetKernelArg(cachedAccumulateKernel, 2, Sizeof.cl_double, Pointer.to(weightScratch));
+                    weightScratch[0] = passWeight;
+                    clSetKernelArg(cachedAccumulateKernel, 3, Sizeof.cl_double, Pointer.to(weightScratch));
+
+                    clEnqueueNDRangeKernel(context.context.queue, cachedAccumulateKernel, 1,
+                            null, accumulateGlobal, null, 0, null, null);
+
+                    committedSpp = (int) Math.min((long) Integer.MAX_VALUE, total);
+                    scene.spp = committedSpp;
+                    sppSinceRedraw += passSpp;
 
                     long nowNanos = System.nanoTime();
                     long sinceLast = lastRedrawNanos == 0
@@ -554,12 +564,7 @@ public class OpenClPathTracingRenderer implements Renderer {
                     }
 
                     if (camera.needGenerate) {
-                        renderLock.lock();
-                        try {
-                            camera.generate(renderLock, true);
-                        } finally {
-                            renderLock.unlock();
-                        }
+                        camera.generate(null, true);
                     }
                     if (postRender.getAsBoolean()) {
                         break;
@@ -591,35 +596,30 @@ public class OpenClPathTracingRenderer implements Renderer {
             int pendingIdx = -1;
             try {
             while (scene.spp < scene.getTargetSpp()) {
-                renderLock.lock();
-                try {
-                    cfg[0] = rand.nextInt();
-                    cfg[1] = 0;
-                    cfg[2] = scene.getEmittersEnabled() ? 1 : 0;
-                    cfg[3] = scene.getEmitterSamplingStrategy().ordinal();
-                    cfg[4] = Math.max(1, scene.getCurrentBranchCount());
-                    // Blocking writes — JOCL forbids non-blocking ops on
-                    // pointers backed by Java heap arrays (the GC could move
-                    // them before the GPU consumes the data). The cfg / emitter
-                    // writes are 20 bytes and 4 bytes respectively, so the
-                    // host-side stall is microseconds and not worth converting
-                    // to direct ByteBuffers. The big read below uses a direct
-                    // ByteBuffer specifically so it CAN be non-blocking.
-                    clEnqueueWriteBuffer(context.context.queue, dynamicConfig.get(), CL_TRUE, 0,
-                            Sizeof.cl_int * cfg.length, cfgPtr, 0, null, null);
-                    float curEmitterIntensity = (float) scene.getEmitterIntensity();
-                    if (curEmitterIntensity != lastEmitterIntensity) {
-                        lastEmitterIntensity = curEmitterIntensity;
-                        emitterIntensityArr[0] = curEmitterIntensity;
-                        clEnqueueWriteBuffer(context.context.queue, emitterIntensityMem.get(), CL_TRUE, 0,
-                                Sizeof.cl_float, emitterIntensityPtr, 0, null, null);
-                    }
-                    clSetKernelArg(kernel, outputArgIndex, Sizeof.cl_mem, outputArgPtrs[curIdx]);
-                    clEnqueueNDRangeKernel(context.context.queue, kernel, 1,
-                            null, dispatchGlobal, null, 0, null, null);
-                } finally {
-                    renderLock.unlock();
+                cfg[0] = rand.nextInt();
+                cfg[1] = 0;
+                cfg[2] = scene.getEmittersEnabled() ? 1 : 0;
+                cfg[3] = scene.getEmitterSamplingStrategy().ordinal();
+                cfg[4] = Math.max(1, scene.getCurrentBranchCount());
+                // Blocking writes — JOCL forbids non-blocking ops on
+                // pointers backed by Java heap arrays (the GC could move
+                // them before the GPU consumes the data). The cfg / emitter
+                // writes are 20 bytes and 4 bytes respectively, so the
+                // host-side stall is microseconds and not worth converting
+                // to direct ByteBuffers. The big read below uses a direct
+                // ByteBuffer specifically so it CAN be non-blocking.
+                clEnqueueWriteBuffer(context.context.queue, dynamicConfig.get(), CL_TRUE, 0,
+                        Sizeof.cl_int * cfg.length, cfgPtr, 0, null, null);
+                float curEmitterIntensity = (float) scene.getEmitterIntensity();
+                if (curEmitterIntensity != lastEmitterIntensity) {
+                    lastEmitterIntensity = curEmitterIntensity;
+                    emitterIntensityArr[0] = curEmitterIntensity;
+                    clEnqueueWriteBuffer(context.context.queue, emitterIntensityMem.get(), CL_TRUE, 0,
+                            Sizeof.cl_float, emitterIntensityPtr, 0, null, null);
                 }
+                clSetKernelArg(kernel, outputArgIndex, Sizeof.cl_mem, outputArgPtrs[curIdx]);
+                clEnqueueNDRangeKernel(context.context.queue, kernel, 1,
+                        null, dispatchGlobal, null, 0, null, null);
                 int passSpp = iterationsPerLaunch * Math.max(1, scene.getCurrentBranchCount());
                 cl_event readEvent = new cl_event();
                 // Map the pinned output buffer for read. With pinned memory
@@ -696,12 +696,7 @@ public class OpenClPathTracingRenderer implements Renderer {
                 }
 
                 if (camera.needGenerate) {
-                    renderLock.lock();
-                    try {
-                        camera.generate(renderLock, true);
-                    } finally {
-                        renderLock.unlock();
-                    }
+                    camera.generate(null, true);
                 }
                 if (postRender.getAsBoolean()) {
                     break;
