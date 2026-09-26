@@ -8,6 +8,7 @@ import dev.thatredox.chunkynative.opencl.tonemap.ChunkyImposterGpuPostProcessing
 import dev.thatredox.chunkynative.opencl.tonemap.HableToneMappingImposterGpuPostprocessingFilter;
 import dev.thatredox.chunkynative.opencl.tonemap.UE4ToneMappingImposterGpuPostprocessingFilter;
 import dev.thatredox.chunkynative.opencl.ui.ChunkyClTab;
+import dev.thatredox.chunkynative.opencl.ui.EmissiveTab;
 import dev.thatredox.chunkynative.opencl.ui.OpenClSettingsLocker;
 import se.llbit.chunky.Plugin;
 import se.llbit.chunky.main.Chunky;
@@ -112,8 +113,9 @@ public class ChunkyCl implements Plugin {
             // when the OpenCL renderer is active
             transformed = new ArrayList<>(OpenClSettingsLocker.wrapTabs(transformed));
 
-            // Add the new tab
+            // Add the new tabs
             transformed.add(new ChunkyClTab(chunky.getSceneManager().getScene()));
+            transformed.add(new EmissiveTab(chunky.getSceneManager().getScene()));
 
             return transformed;
         });

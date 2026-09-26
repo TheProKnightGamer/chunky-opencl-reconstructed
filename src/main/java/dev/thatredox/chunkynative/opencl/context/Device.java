@@ -67,6 +67,20 @@ public class Device {
         }
     }
 
+    /**
+     * Whether this is an NVIDIA device that accepts the {@code -cl-nv-*} build
+     * options (it advertises {@code cl_nv_compiler_options}). Passing those
+     * options to any other vendor's compiler fails the build.
+     */
+    public boolean supportsNvCompilerOptions() {
+        try {
+            String extensions = getString(CL_DEVICE_EXTENSIONS);
+            return extensions != null && extensions.contains("cl_nv_compiler_options");
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
     public enum DeviceType {
         CPU("CPU"), GPU("GPU"), ACCELERATOR("Accelerator"),
         CUSTOM("Custom"), UNKNOWN("Unknown");

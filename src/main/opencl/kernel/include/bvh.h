@@ -19,7 +19,7 @@ Bvh Bvh_new(__global const int* bvh, __global const int* trigs, MaterialPalette*
     return b;
 }
 
-bool Bvh_intersect(Bvh self, image2d_array_t atlas, MaterialPalette palette, Ray ray, IntersectionRecord* record, MaterialSample* sample) {
+bool Bvh_intersect(Bvh self, image2d_array_t atlas, MaterialPalette palette, Ray ray, IntersectionRecord* record) {
     bool hit = false;
     
     int toVisit = 0;
@@ -42,7 +42,7 @@ bool Bvh_intersect(Bvh self, image2d_array_t atlas, MaterialPalette palette, Ray
 
             for (int i = 0; i < min(numPrim, 256); i++) {
                 Triangle trig = Triangle_new(self.trigs, primIndex + 1 + TRIANGLE_SIZE * i);
-                hit |= Triangle_intersect(trig, atlas, palette, ray, record, sample);
+                hit |= Triangle_intersect(trig, atlas, palette, ray, record);
             }
 
             if (toVisit == 0) break;

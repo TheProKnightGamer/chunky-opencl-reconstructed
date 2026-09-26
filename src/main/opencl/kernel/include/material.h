@@ -36,17 +36,24 @@ typedef struct {
     unsigned int normal_emittance;
     unsigned int specular_metalness_roughness;
     unsigned int ior_and_flags;
+    unsigned int emission_map;   // atlas location, valid when (flags & 0b010)
 } Material;
 
 // Material dword size (must match PackedMaterial.MATERIAL_DWORD_SIZE in Java)
-#define MATERIAL_DWORD_SIZE 7
+#define MATERIAL_DWORD_SIZE 8
+
+// Emission maps (flags & 0b010): emission_map is an atlas texture laid out like the
+// colour texture. A texel emits normal_emittance/255 times the map's alpha. The map's
+// RGB is the block's emission-weighted mean colour, and ior_and_flags bits 19-31 hold
+// the block's mean emission * 8191; emitter sampling of models uses those two.
+#define MATERIAL_HAS_EMISSION_MAP 0b010
 
 Material Material_get(MaterialPalette self, int material) {
     Material m;
     int base = material;
     // If material index falls within the cached words, use the local cache
     // (faster local memory) otherwise read from global palette.
-    if (self.matCacheWords > 0 && base + 6 < self.matCacheWords) {
+    if (self.matCacheWords > 0 && base + (MATERIAL_DWORD_SIZE - 1) < self.matCacheWords) {
         m.flags = self.matCache[base + 0];
         m.tint = self.matCache[base + 1];
         m.textureSize = self.matCache[base + 2];
@@ -54,6 +61,7 @@ Material Material_get(MaterialPalette self, int material) {
         m.normal_emittance = self.matCache[base + 4];
         m.specular_metalness_roughness = self.matCache[base + 5];
         m.ior_and_flags = self.matCache[base + 6];
+        m.emission_map = (m.flags & MATERIAL_HAS_EMISSION_MAP) ? self.matCache[base + 7] : 0;
     } else {
         m.flags = self.palette[base + 0];
         m.tint = self.palette[base + 1];
@@ -62,6 +70,7 @@ Material Material_get(MaterialPalette self, int material) {
         m.normal_emittance = self.palette[base + 4];
         m.specular_metalness_roughness = self.palette[base + 5];
         m.ior_and_flags = self.palette[base + 6];
+        m.emission_map = (m.flags & MATERIAL_HAS_EMISSION_MAP) ? self.palette[base + 7] : 0;
     }
     return m;
 }
@@ -78,6 +87,18 @@ typedef struct {
     bool isWater;
     int tintType;      // 0=none, 1=foliage, 2=grass, 3=water, 4=dryFoliage (for biome lookup)
 } MaterialSample;
+
+// Constant tints are applied here; biome tints are only tagged (tintType 1-4)
+// and applied by applyBiomeTint, which knows the hit position.
+void Material_applyTint(Material self, MaterialSample* sample) {
+    sample->tintType = 0;
+    int tintTag = self.tint >> 24;
+    if (tintTag == 0xFF) {
+        sample->color.xyz *= colorFromArgb(self.tint).xyz;  // RGB only, as CPU Tint does
+    } else if (tintTag >= 1 && tintTag <= 4) {
+        sample->tintType = tintTag;
+    }
+}
 
 bool Material_sample(Material self, image2d_array_t atlas, float2 uv, MaterialSample* sample) {
     // Color
@@ -96,8 +117,12 @@ bool Material_sample(Material self, image2d_array_t atlas, float2 uv, MaterialSa
         color = colorFromArgb(self.color);
 
     if (self.tint == 0xFE000000) {
-        // Light block: use texture color for preview, white fallback for path tracing
-        // (CPU LightBlock uses white (1,1,1,1) as base color with emittance from level)
+        // Light block material: never fail the sample — transparent texels of
+        // the light texture fall back to opaque white so emittance/ior/etc are
+        // always populated. The emitter-NEE octree lookup in rayTracer.c
+        // depends on this (CPU sampleEmitterFace sees the flat-white
+        // LightBlockModel), and block.h overrides path-trace hits to flat
+        // white; the texture color only shows in the preview.
         if (color.w > EPS) {
             sample->color = color;
         } else {
@@ -112,6 +137,11 @@ bool Material_sample(Material self, image2d_array_t atlas, float2 uv, MaterialSa
         if (isRefractive) {
             sample->color = color;
             sample->color.w = 0.0f;
+            // This early return used to skip the tint below and leave tintType
+            // holding whatever the caller's sample last held. applyBiomeTint uses
+            // tintType as a biome-buffer offset, so a stale value read far out of
+            // bounds (NVIDIA Xid 31 MMU fault on see-through glass texels).
+            Material_applyTint(self, sample);
             // Still populate material properties for the pass-through
             sample->ior = (float)(self.ior_and_flags & 0xFFFF) / 1000.0f;
             if (sample->ior < 0.01f) sample->ior = AIR_IOR;
@@ -128,25 +158,13 @@ bool Material_sample(Material self, image2d_array_t atlas, float2 uv, MaterialSa
     }
 
     // Tint: apply constant tints directly, defer biome tints to caller
-    sample->tintType = 0;
-    {
-        int tintTag = self.tint >> 24;
-        if (tintTag == 0xFF) {
-            sample->color *= colorFromArgb(self.tint);
-        } else if (tintTag >= 1 && tintTag <= 4) {
-            // Store biome tint type; caller applies biome color or hardcoded fallback
-            sample->tintType = tintTag;
-        }
-    }
+    Material_applyTint(self, sample);
 
-    // (Normal) emittance
-    if (self.flags & 0b010)
-        sample->emittance = Atlas_read_uv(uv.x, uv.y, self.normal_emittance, self.textureSize, atlas).w;
-    else
-        // When no texture, the full 32-bit word is (int)(emittance * 255).
-        // Light blocks can have emittance > 1.0 (up to 4.0 for level 15),
-        // so use the full int value instead of masking to 8 bits.
-        sample->emittance = (float)self.normal_emittance / 255.0f;
+    // Emittance. The full 32-bit word is (int)(emittance * 255): light blocks and
+    // user-set emittance go above 1.0, so it is not masked to 8 bits.
+    sample->emittance = (float)self.normal_emittance / 255.0f;
+    if (self.flags & MATERIAL_HAS_EMISSION_MAP)
+        sample->emittance *= Atlas_read_uv(uv.x, uv.y, self.emission_map, self.textureSize, atlas).w;
 
     // specular, metalness, roughness
     if (self.flags & 0b001) {
@@ -169,6 +187,54 @@ bool Material_sample(Material self, image2d_array_t atlas, float2 uv, MaterialSa
     sample->isWater = (self.ior_and_flags >> 18) & 1;
 
     return true;
+}
+
+// True exactly when Material_sample(self, atlas, uv, ...) would return true,
+// i.e. the texel is a surface and not a hole. Reads only the colour texel, so
+// traversal can reject cut-out texels (leaves, glass pane edges) without
+// building the full sample.
+bool Material_alphaTest(Material self, image2d_array_t atlas, float2 uv) {
+    if ((self.ior_and_flags >> 18) & 1) return true;   // water: flat colour, always a hit
+    if (self.tint == 0xFE000000) return true;           // light block: never fails
+    float alpha;
+    if (self.flags & 0b100)
+        alpha = Atlas_read_uv(uv.x, uv.y, self.color, self.textureSize, atlas).w;
+    else
+        alpha = colorFromArgb(self.color).w;
+    if (alpha > EPS) return true;
+    return (self.ior_and_flags >> 16) & 1;              // refractive holes still refract
+}
+
+// True exactly when Material_sample would report a fully opaque, non-refractive,
+// non-water surface (color.w > 1 - EPS): the case a shadow ray cannot pass. Reads
+// only the colour texel.
+bool Material_isOpaqueAt(Material self, image2d_array_t atlas, float2 uv) {
+    if ((self.ior_and_flags >> 16) & 0b101) return false;  // refractive or water
+    if (self.tint == 0xFE000000) return false;              // light block
+    float alpha;
+    if (self.flags & 0b100)
+        alpha = Atlas_read_uv(uv.x, uv.y, self.color, self.textureSize, atlas).w;
+    else
+        alpha = colorFromArgb(self.color).w;
+    return alpha > 1.0f - EPS;
+}
+
+// The emittance Material_sample would report.
+float Material_emittanceAt(Material self, image2d_array_t atlas, float2 uv) {
+    float e = (float)self.normal_emittance / 255.0f;
+    if (self.flags & MATERIAL_HAS_EMISSION_MAP)
+        e *= Atlas_read_uv(uv.x, uv.y, self.emission_map, self.textureSize, atlas).w;
+    return e;
+}
+
+// The light a model block's emission map gives off on average, for emitter sampling,
+// which cannot afford to find the few glowing texels of, say, a torch. Colour is the
+// emission-weighted mean colour; emittance is scaled by the block's mean emission.
+void Material_meanEmission(Material self, image2d_array_t atlas, MaterialSample* sample) {
+    float4 texel = Atlas_read_uv(0.5f, 0.5f, self.emission_map, self.textureSize, atlas);
+    sample->color = (float4)(texel.xyz, 1.0f);
+    sample->emittance = (float)self.normal_emittance / 255.0f
+                      * (float)(self.ior_and_flags >> 19) / 8191.0f;
 }
 
 float3 _Material_diffuseReflection(IntersectionRecord record, Random random) {

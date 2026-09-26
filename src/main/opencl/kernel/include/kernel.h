@@ -28,6 +28,8 @@ typedef struct {
     bool useCustomWaterColor;
     float waterIor;
     float waterOpacity;
+    bool hasWaterBlocks;   // the water octree holds at least one block
+    AABB waterBounds;      // octree-local bounds of those blocks
     WaterShaderParams waterShaderParams;
     __global const float* waterNormalMap;
     int waterNormalMapW;
@@ -85,7 +87,7 @@ inline void FillWaterSample(MaterialSample *s, const SceneConfig *cfg) {
 
 bool Cloud_intersect(float cloudHeight, float cloudSize, float cloudOffsetX, float cloudOffsetZ,
                      __global const int* cloudData, Ray tempRay,
-                     IntersectionRecord* record, MaterialSample* sample, bool hasCloserHit) {
+                     IntersectionRecord* record, bool hasCloserHit) {
     const float inv_size = 1.0f / cloudSize;
     const float cloudTop = cloudHeight + 5.0f;
     float oy = tempRay.origin.y;
@@ -109,16 +111,7 @@ bool Cloud_intersect(float cloudHeight, float cloudSize, float cloudOffsetX, flo
                 float3 hitP = tempRay.origin + tempRay.direction * cloudT;
                 record->texCoord = (float2)(hitP.x * inv_size + cloudOffsetX - floor(hitP.x * inv_size + cloudOffsetX),
                                             hitP.z * inv_size + cloudOffsetZ - floor(hitP.z * inv_size + cloudOffsetZ));
-                sample->color = (float4)(1.0f, 1.0f, 1.0f, 1.0f);
-                sample->emittance = 0.0f;
-                sample->specular = 0.0f;
-                sample->metalness = 0.0f;
-                sample->roughness = 1.0f;
-                sample->ior = AIR_IOR;
-                sample->refractive = false;
-                sample->sss = false;
-                sample->isWater = false;
-                sample->tintType = 0;
+                record->hitKind = HIT_CLOUD;
                 return true;
             }
             return false;
@@ -212,6 +205,45 @@ bool Cloud_intersect(float cloudHeight, float cloudSize, float cloudOffsetX, flo
         float3 hitP = tempRay.origin + tempRay.direction * cloudT;
         record->texCoord = (float2)(hitP.x * inv_size + cloudOffsetX - floor(hitP.x * inv_size + cloudOffsetX),
                                     hitP.z * inv_size + cloudOffsetZ - floor(hitP.z * inv_size + cloudOffsetZ));
+        record->hitKind = HIT_CLOUD;
+        return true;
+    }
+    return false;
+}
+
+// Limits a water-octree march to the part of the ray that can meet a water
+// block: returns false when the ray cannot reach one before *limit, otherwise
+// shrinks *limit to just past the blocks' bounding box. Exact: water hits only
+// exist inside the box, so the march finds the same hit or none. Without it every
+// ray above the water line (and every shadow ray climbing toward the sun) walked
+// the whole water octree to the edge of the scene.
+bool Water_clipToBlocks(const SceneConfig* cfg, Ray ray, float* limit) {
+    if (!cfg->hasWaterBlocks) return false;
+    float3 invD = select(1.0f / ray.direction, copysign((float3)(1e30f), ray.direction), fabs(ray.direction) < 1e-30f);
+    AABB b = cfg->waterBounds;
+    // A thousandth of a block of padding: keeps a hit computed a rounding step
+    // outside the box, or a ray running exactly along a face, inside the clip.
+    const float pad = 1e-3f;
+    float3 t1 = ((float3)(b.xmin - pad, b.ymin - pad, b.zmin - pad) - ray.origin) * invD;
+    float3 t2 = ((float3)(b.xmax + pad, b.ymax + pad, b.zmax + pad) - ray.origin) * invD;
+    float3 lo = fmin(t1, t2);
+    float3 hi = fmax(t1, t2);
+    float tEnter = fmax(lo.x, fmax(lo.y, lo.z));
+    float tExit = fmin(hi.x, fmin(hi.y, hi.z));
+    if (!(tExit >= fmax(tEnter, 0.0f)) || tEnter > *limit) return false;
+    // A block-sized margin keeps DDA stepping offsets well clear of the cut.
+    *limit = fmin(*limit, tExit * 1.0001f + 1.0f);
+    return true;
+}
+
+// Builds the MaterialSample for the winning hit of a trace. Exactly one
+// Material_sample per trace, instead of one per primitive tested.
+void Hit_resolveSample(IntersectionRecord record, image2d_array_t atlas, MaterialPalette materialPalette,
+                       const SceneConfig* cfg, bool previewWaterOpacity, MaterialSample* sample) {
+    int kind = record.hitKind & HIT_KIND_MASK;
+    if (kind == HIT_WATER_PLANE) {
+        FillWaterSample(sample, cfg);
+    } else if (kind == HIT_CLOUD) {
         sample->color = (float4)(1.0f, 1.0f, 1.0f, 1.0f);
         sample->emittance = 0.0f;
         sample->specular = 0.0f;
@@ -222,41 +254,79 @@ bool Cloud_intersect(float cloudHeight, float cloudSize, float cloudOffsetX, flo
         sample->sss = false;
         sample->isWater = false;
         sample->tintType = 0;
-        return true;
+    } else if (kind == HIT_WATER_EXIT_PLAIN) {
+        sample->color = (float4)(1.0f, 1.0f, 1.0f, 1.0f);
+        sample->emittance = 0.0f;
+        sample->specular = 0.12f;
+        sample->metalness = 0.0f;
+        sample->roughness = 0.0f;
+        sample->ior = 1.333f;
+        sample->refractive = true;
+        sample->sss = false;
+        sample->isWater = true;
+        sample->tintType = 3;
+    } else {
+        float2 uv = (kind == HIT_WATER_EXIT_CENTER) ? (float2)(0.5f, 0.5f) : record.texCoord;
+        Material_sample(Material_get(materialPalette, record.material), atlas, uv, sample);
+        if (kind == HIT_LIGHT_WHITE) {
+            sample->color = (float4)(1.0f, 1.0f, 1.0f, 1.0f);
+        } else if (kind == HIT_WATER_EXIT_CENTER || kind == HIT_WATER_EXIT_UV) {
+            sample->isWater = true;
+        }
     }
-    return false;
+    if ((record.hitKind & HIT_FLAG_WATER_BRANCH) && sample->isWater) {
+        if (cfg->useCustomWaterColor) {
+            sample->color.xyz = cfg->waterColor;
+            sample->tintType = 0;
+        } else if (sample->tintType == 0) {
+            sample->tintType = 3;
+        }
+        if (previewWaterOpacity) {
+            sample->color.w = cfg->waterOpacity;
+        }
+    }
 }
 
-// NOTE: `mat` is NEVER written and must not be read by callers. Its only
-// consumer was Material_samplePdf's `self` parameter, which is unused.
-bool closestIntersect(SceneConfig self, image2d_array_t atlas, Ray ray, IntersectionRecord* record, MaterialSample* sample, Material* mat) {
+// Finds the closest surface along a ray. With stopAtOpaque (sun / fog shadow
+// rays only), a fully opaque world block is reported as soon as the world octree
+// finds it, skipping the water march, both entity BVHs, the water plane and the
+// clouds: the shadow loop turns ANY opaque occluder into zero light, whatever
+// translucent layers lie in front of it, so the answer is the same. Two edge cases
+// now return that zero where the old loop could leak light: past its 32-layer cap
+// (the uncapped CPU renderer also returns zero), and a closer hit lying within
+// OFFSET of the opaque block's face (the loop stepped past it into the block, whose
+// face it then rejected). Emitter NEE must not use this: it compares the hit
+// distance against the emitter's.
+bool traceScene(SceneConfig self, image2d_array_t atlas, Ray ray, IntersectionRecord* record, MaterialSample* sample,
+                bool stopAtOpaque) {
     IntersectionRecord tempRecord = *record;
     bool hit = false;
-    hit |= Octree_octreeIntersect(self.octree, atlas, self.blockPalette, self.materialPalette, self.drawDepth, ray, &tempRecord, sample);
-    hit |= Bvh_intersect(self.worldBvh, atlas, self.materialPalette, ray, &tempRecord, sample);
-    hit |= Bvh_intersect(self.actorBvh, atlas, self.materialPalette, ray, &tempRecord, sample);
+    hit |= Octree_octreeIntersect(self.octree, atlas, self.blockPalette, self.materialPalette, self.drawDepth, ray, &tempRecord);
+    if (stopAtOpaque && hit && tempRecord.hitKind == HIT_MATERIAL
+            && Material_isOpaqueAt(Material_get(self.materialPalette, tempRecord.material), atlas, tempRecord.texCoord)) {
+        // Only what the shadow loop reads: the distance, and an opaque sample.
+        *record = tempRecord;
+        record->geomNormal = record->normal;
+        sample->color = (float4)(0.0f, 0.0f, 0.0f, 1.0f);
+        sample->refractive = false;
+        sample->isWater = false;
+        return true;
+    }
+    hit |= Bvh_intersect(self.worldBvh, atlas, self.materialPalette, ray, &tempRecord);
+    hit |= Bvh_intersect(self.actorBvh, atlas, self.materialPalette, ray, &tempRecord);
     {
         IntersectionRecord waterRecord = tempRecord;
         if (!hit) waterRecord.distance = record->distance;
-        MaterialSample waterSample;
         bool waterHit = false;
         if (ray.inWater) {
             waterRecord.distance = hit ? (tempRecord.distance + EPS) : record->distance;
-            waterHit = Octree_exitWater(self.waterOctree, atlas, self.blockPalette, self.materialPalette, self.drawDepth, ray, &waterRecord, &waterSample);
-        } else {
-            waterHit = Octree_octreeIntersect(self.waterOctree, atlas, self.blockPalette, self.materialPalette, self.drawDepth, ray, &waterRecord, &waterSample);
+            waterHit = Octree_exitWater(self.waterOctree, atlas, self.blockPalette, self.materialPalette, self.drawDepth, ray, &waterRecord);
+        } else if (Water_clipToBlocks(&self, ray, &waterRecord.distance)) {
+            waterHit = Octree_octreeIntersect(self.waterOctree, atlas, self.blockPalette, self.materialPalette, self.drawDepth, ray, &waterRecord);
         }
         if (waterHit && (!hit || waterRecord.distance < tempRecord.distance)) {
-            if (waterSample.isWater) {
-                if (self.useCustomWaterColor) {
-                    waterSample.color.xyz = self.waterColor;
-                    waterSample.tintType = 0;
-                } else if (waterSample.tintType == 0) {
-                    waterSample.tintType = 3;
-                }
-            }
             tempRecord = waterRecord;
-            *sample = waterSample;
+            tempRecord.hitKind |= HIT_FLAG_WATER_BRANCH;
             hit = true;
         }
     }
@@ -269,23 +339,24 @@ bool closestIntersect(SceneConfig self, image2d_array_t atlas, Ray ray, Intersec
                                  &waterRecord)) {
             if (!hit || waterRecord.distance < tempRecord.distance) {
                 tempRecord = waterRecord;
-                FillWaterSample(sample, &self);
                 // Wave shading is deferred to the unified water-shading block
                 // below (after geomNormal is pinned to the flat normal), so the
                 // flat plane normal survives for the anti-leak corrections
                 // instead of being clobbered by the blanket geomNormal=normal.
+                tempRecord.hitKind = HIT_WATER_PLANE;
                 hit = true;
             }
         }
     }
     if (self.cloudsEnabled) {
         if (Cloud_intersect(self.cloudHeight, self.cloudSize, self.cloudOffsetX, self.cloudOffsetZ,
-                            self.cloudData, ray, &tempRecord, sample, hit)) {
+                            self.cloudData, ray, &tempRecord, hit)) {
             hit = true;
         }
     }
     if (!hit) return false;
     *record = tempRecord;
+    Hit_resolveSample(tempRecord, atlas, self.materialPalette, &self, false, sample);
     record->geomNormal = record->normal;
     if (sample->isWater) {
         // Water BLOCKS (material >= 0) get opacity / custom color applied here;
@@ -319,6 +390,12 @@ bool closestIntersect(SceneConfig self, image2d_array_t atlas, Ray ray, Intersec
     return true;
 }
 
+// NOTE: `mat` is NEVER written and must not be read by callers. Its only
+// consumer was Material_samplePdf's `self` parameter, which is unused.
+bool closestIntersect(SceneConfig self, image2d_array_t atlas, Ray ray, IntersectionRecord* record, MaterialSample* sample, Material* mat) {
+    return traceScene(self, atlas, ray, record, sample, false);
+}
+
 // Simplified intersection for preview mode, matching CPU PreviewRayTracer:
 // - Tests water plane (with chunk clip, covers unloaded areas)
 // - Tests octree + BVH (solid geometry)
@@ -339,59 +416,52 @@ bool previewIntersect(SceneConfig self, image2d_array_t atlas, Ray ray,
                                  self.chunkBitmap, self.chunkBitmapSize,
                                  &wpRecord)) {
             tempRecord = wpRecord;
-            FillWaterSample(sample, &self);
+            tempRecord.hitKind = HIT_WATER_PLANE;
             tempRecord.geomNormal = tempRecord.normal;
             hit = true;
         }
     }
     // Solid geometry (octree + BVH)
-    hit |= Octree_octreeIntersect(self.octree, atlas, self.blockPalette, self.materialPalette, self.drawDepth, ray, &tempRecord, sample);
-    hit |= Bvh_intersect(self.worldBvh, atlas, self.materialPalette, ray, &tempRecord, sample);
-    hit |= Bvh_intersect(self.actorBvh, atlas, self.materialPalette, ray, &tempRecord, sample);
+    hit |= Octree_octreeIntersect(self.octree, atlas, self.blockPalette, self.materialPalette, self.drawDepth, ray, &tempRecord);
+    hit |= Bvh_intersect(self.worldBvh, atlas, self.materialPalette, ray, &tempRecord);
+    hit |= Bvh_intersect(self.actorBvh, atlas, self.materialPalette, ray, &tempRecord);
     // Water octree (covers loaded chunks where the water plane is clipped)
     {
         IntersectionRecord waterRecord = tempRecord;
         if (!hit) waterRecord.distance = record->distance;
-        MaterialSample waterSample;
         bool waterHit = false;
         if (ray.inWater) {
             // Underwater: use exitWater to find where ray leaves the water volume
             waterRecord.distance = hit ? (tempRecord.distance + EPS) : record->distance;
-            waterHit = Octree_exitWater(self.waterOctree, atlas, self.blockPalette, self.materialPalette, self.drawDepth, ray, &waterRecord, &waterSample);
-        } else {
+            waterHit = Octree_exitWater(self.waterOctree, atlas, self.blockPalette, self.materialPalette, self.drawDepth, ray, &waterRecord);
+        } else if (Water_clipToBlocks(&self, ray, &waterRecord.distance)) {
             // Above water: find entry into water blocks
-            waterHit = Octree_octreeIntersect(self.waterOctree, atlas, self.blockPalette, self.materialPalette, self.drawDepth, ray, &waterRecord, &waterSample);
+            waterHit = Octree_octreeIntersect(self.waterOctree, atlas, self.blockPalette, self.materialPalette, self.drawDepth, ray, &waterRecord);
         }
         if (waterHit && (!hit || waterRecord.distance < tempRecord.distance)) {
-            if (waterSample.isWater) {
-                if (self.useCustomWaterColor) {
-                    waterSample.color.xyz = self.waterColor;
-                    waterSample.tintType = 0;
-                } else if (waterSample.tintType == 0) {
-                    waterSample.tintType = 3;
-                }
-                waterSample.color.w = self.waterOpacity;
-            }
             tempRecord = waterRecord;
-            *sample = waterSample;
+            tempRecord.hitKind |= HIT_FLAG_WATER_BRANCH;
             hit = true;
         }
     }
     // Clouds — the CPU preview (PreviewRayTracer.nextIntersection) renders them too.
     if (self.cloudsEnabled) {
         if (Cloud_intersect(self.cloudHeight, self.cloudSize, self.cloudOffsetX, self.cloudOffsetZ,
-                            self.cloudData, ray, &tempRecord, sample, hit)) {
+                            self.cloudData, ray, &tempRecord, hit)) {
             hit = true;
         }
     }
     if (!hit) return false;
     *record = tempRecord;
+    Hit_resolveSample(tempRecord, atlas, self.materialPalette, &self, true, sample);
     record->geomNormal = record->normal;
     return true;
 }
 
 void applyBiomeTint(SceneConfig scene, MaterialSample* sample, float3 hitPos) {
-    if (sample->tintType == 0) return;
+    // tintType indexes the biome buffer below, so anything outside 1-4 must never
+    // get there (an out-of-range value is an out-of-bounds read, not a wrong tint).
+    if (sample->tintType < 1 || sample->tintType > 4) return;
     float3 tintColor;
     if (scene.biomeColorsEnabled && scene.biomeDataSize > 0) {
         int bx = (int)floor(hitPos.x);

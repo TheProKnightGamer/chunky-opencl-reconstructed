@@ -3,6 +3,7 @@ package dev.thatredox.chunkynative.common.export.primitives;
 import dev.thatredox.chunkynative.common.export.texture.AbstractTextureLoader;
 import dev.thatredox.chunkynative.common.export.Packer;
 import dev.thatredox.chunkynative.common.export.ResourcePalette;
+import dev.thatredox.chunkynative.common.export.GpuMaterialOverrides;
 import dev.thatredox.chunkynative.common.export.models.PackedAabbModel;
 import dev.thatredox.chunkynative.common.export.models.PackedQuadModel;
 import it.unimi.dsi.fastutil.ints.IntArrayList;
@@ -66,11 +67,22 @@ public class PackedBlock implements Packer {
             modelType = 0;
             modelPointer = 0;
             waterData = 0;
+        } else if (GpuMaterialOverrides.isIce(block)) {
+            // Ice family: GPU-only override to dense refractive ice. Gives packed/blue
+            // ice the transparency they lack upstream (so their shared faces cull at
+            // all), and makes all four harder to see through. See GpuMaterialOverrides.
+            modelType = 1;
+            modelPointer = materialPalette.put(new PackedMaterial(
+                    GpuMaterialOverrides.iceTexture(block.texture), Tint.NONE,
+                    block.emittance, block.specular, block.metalness, block.roughness,
+                    GpuMaterialOverrides.ICE_IOR, true, block.subSurfaceScattering, false,
+                    block, textureLoader));
+            waterData = 0;
         } else {
             modelType = 1;
             modelPointer = materialPalette.put(new PackedMaterial(block.texture, Tint.NONE,
                     block.emittance, block.specular, block.metalness, block.roughness,
-                    block.ior, block.refractive, block.subSurfaceScattering, false, textureLoader));
+                    block.ior, block.refractive, block.subSurfaceScattering, false, block, textureLoader));
             waterData = 0;
         }
     }
@@ -89,9 +101,18 @@ public class PackedBlock implements Packer {
                 throw new RuntimeException(String.format(
                         "Unknown model type for block %s: %s", block.name, b.getModel()));
             }
-            textures.forEach(textureLoader::get);
+            textures.forEach(t -> {
+                textureLoader.get(t);
+                textureLoader.getEmission().preload(block, t, textureLoader);
+            });
         } else if (!block.invisible) {
-            textureLoader.get(block.texture);
+            // Must request the SAME instance the constructor will pack, otherwise the
+            // substituted texture first appears after build() has locked the loader.
+            Texture t = GpuMaterialOverrides.isIce(block)
+                    ? GpuMaterialOverrides.iceTexture(block.texture)
+                    : block.texture;
+            textureLoader.get(t);
+            textureLoader.getEmission().preload(block, t, textureLoader);
         }
     }
 

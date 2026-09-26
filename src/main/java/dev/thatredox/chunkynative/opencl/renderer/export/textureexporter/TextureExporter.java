@@ -1,5 +1,6 @@
 package dev.thatredox.chunkynative.opencl.renderer.export.textureexporter;
 
+import dev.thatredox.chunkynative.common.emissive.EmissionMaskTexture;
 import se.llbit.chunky.resources.AnimatedTexture;
 import se.llbit.chunky.resources.SignTexture;
 import se.llbit.chunky.resources.Texture;
@@ -17,6 +18,9 @@ public interface TextureExporter {
     static TextureExporter getExporter(Texture texture, double animationTime) {
         if (texture instanceof SignTexture) {
             return new SignTextureExporter((SignTexture) texture);
+        }
+        if (texture instanceof EmissionMaskTexture) {
+            return new EmissionMaskExporter((EmissionMaskTexture) texture, animationTime);
         }
         if (texture instanceof AnimatedTexture) {
             return new AnimatedTextureExporter((AnimatedTexture) texture, animationTime);

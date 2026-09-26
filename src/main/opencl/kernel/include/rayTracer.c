@@ -186,6 +186,32 @@ Ray ray_to_camera(
     return ray;
 }
 
+// Light for an emitter-NEE shadow ray that reached the emitter's cell (ex,ey,ez)
+// without hitting its geometry: a light block (invisible to shadow rays), or a
+// small model the ray slipped past. It comes from the block's own material; cubes
+// are sampled at the chosen face point, models at their texture centre. With no
+// usable material (air, or a see-through texel) the emitter contributes nothing:
+// the sample is zeroed first, as the caller reads its colour and emittance.
+void Emitter_sampleCell(BlockPalette palette, MaterialPalette materialPalette, image2d_array_t atlas,
+                        Octree* octree, int ex, int ey, int ez, float2 uv, MaterialSample* sample) {
+    sample->color = (float4)(0.0f);
+    sample->emittance = 0.0f;
+    int block = Octree_get(octree, ex, ey, ez);
+    if (block <= 0) return;
+    int material = BlockPalette_emitterMaterial(palette, block);
+    if (material < 0) return;
+    bool isModel = palette.blockPalette[block] == 2 || palette.blockPalette[block] == 3;
+    Material m = Material_get(materialPalette, material);
+    if (isModel && (m.flags & MATERIAL_HAS_EMISSION_MAP)) {
+        Material_meanEmission(m, atlas, sample);
+        return;
+    }
+    if (!Material_sample(m, atlas, isModel ? (float2)(0.5f, 0.5f) : uv, sample)) {
+        sample->color = (float4)(0.0f);
+        sample->emittance = 0.0f;
+    }
+}
+
 // Trace a shadow ray toward the sun, accumulating attenuation through translucent materials.
 // Returns the color attenuation along the path (white = fully lit, black = fully shadowed).
 // Matches CPU PathTracer.getDirectLightAttenuation() with RGBA tracking, water fog, and strict direct light.
@@ -226,9 +252,15 @@ float3 getDirectLightAttenuation(
         IntersectionRecord srec = IntersectionRecord_new();
         srec.distance = maxDist;
         MaterialSample sMat;
-        Material sSample;
 
-        if (!closestIntersect(scene, textureAtlas, shadow, &srec, &sMat, &sSample)) {
+        if (!traceScene(scene, textureAtlas, shadow, &srec, &sMat, true)) {
+            // Escaped without finding a surface. If we are STILL submerged, the
+            // path to the sun is an unbounded water column (the unloaded-chunk
+            // case again) which transmits nothing — so this is full shadow, not
+            // the clear path the plain break would report. Without this the same
+            // geometry that used to render black would instead leak FULL sun,
+            // and the volumetric in-scatter would amplify it.
+            if (shadow.inWater) return (float3)(0.0f);
             break; // Clear path to sun
         }
 
@@ -256,20 +288,38 @@ float3 getDirectLightAttenuation(
         attenuation.z *= sMat.color.z * sMat.color.w + mult;
         alphaAtt *= mult;
 
-        // Water fog attenuation in shadow rays.
-        // Matches CPU: checks prevMaterial.isWater() — fog is applied for
-        // the distance the shadow ray traveled through water to reach this hit.
+        // Water fog attenuation in shadow rays, now PER CHANNEL: sunlight
+        // reaching a deep seabed has had its red end absorbed on the way down,
+        // which is what tints everything underwater blue-green.
         if (shadow.inWater) {
             if (scene.waterVisibility <= 0) {
                 alphaAtt = 0.0f;
             } else {
-                float a = srec.distance / scene.waterVisibility;
-                alphaAtt *= exp(-a);
+                attenuation *= Water_extinction(srec.distance, scene.waterVisibility);
             }
         }
 
-        // Strict direct light: block shadow ray if it crosses an IOR boundary
-        if (strictDirectLight && shadow.currentIor != sMat.ior) {
+        // CAUSTICS. The sun ray is crossing a water surface, so refract it
+        // against the live wave field and weight it by how much that wave
+        // focuses light. Shadow rays deliberately skip wave shading for CPU
+        // parity (kernel.h), so srec.normal here is FLAT — the wave normal has
+        // to be sampled directly, from the same noise that shapes the surface.
+        if (sMat.isWater) {
+            float3 sHit = shadow.origin + shadow.direction * srec.distance;
+            float3 waveN = Water_waveNormal(scene.waterShadingStrategy, scene.animationTime,
+                                            sHit.x, sHit.z, scene.waterShaderParams,
+                                            scene.waterNormalMap, scene.waterNormalMapW);
+            attenuation *= Water_causticFactor(waveN, shadow.direction);
+        }
+
+        // Strict direct light: CPU zeroes the NEE ray at ANY IOR boundary
+        // (PathTracer.java:581), because a straight shadow ray through a
+        // refracting surface is not a valid estimator. Underwater that kills
+        // direct sun outright — the "rays die off" report. WATER is now exempt:
+        // the caustic term above is what accounts for the refraction, so the ray
+        // is kept and weighted instead of discarded. Every other refractive
+        // boundary (glass) keeps CPU's hard cut so nothing else shifts.
+        if (strictDirectLight && shadow.currentIor != sMat.ior && !sMat.isWater) {
             alphaAtt = 0.0f;
         }
 
@@ -277,6 +327,18 @@ float3 getDirectLightAttenuation(
         maxDist -= srec.distance + OFFSET;
         shadow.origin = shadow.origin + shadow.direction * (srec.distance + OFFSET);
         shadow.currentIor = sMat.ior;
+        // Carry the medium we just entered into the next traversal. Without this
+        // the shadow ray re-hit EVERY internal face of a translucent volume and
+        // attenuated once per block, so an N-thick glass/ice/leaf wall darkened
+        // the sun N times instead of once. The water case was already special-
+        // cased above for exactly this reason; this generalises it to full cubes
+        // and refractive blocks. Water is deliberately left alone — its medium is
+        // seeded once at init above and that path is tuned around it.
+        if (!sMat.isWater) {
+            shadow.material = (sMat.ior > AIR_IOR + EPS
+                    || BlockPalette_isFullCube(scene.blockPalette, srec.blockData))
+                ? srec.blockData : 0;
+        }
 
         // Track water medium transitions for shadow ray
         if (sMat.isWater) {
@@ -348,17 +410,46 @@ __kernel void render(
 
     __global float* res,
 
-    // Total pixel count. We over-launch fewer work-items than pixels and let
-    // each work-item iterate over multiple pixels via a grid-stride loop;
-    // this keeps warps full when individual paths terminate at very
-    // different bounce depths instead of stalling lockstep on the longest
-    // path in the warp. Bit-exact parity preserved because each pixel still
-    // gets the same RNG seed (gid * constant + iter * constant).
+    // Pixel walk for this dispatch: start at pixelStart and step by pixelStride
+    // until pixelCount. We over-launch fewer work-items than pixels and let each
+    // work-item iterate over multiple pixels via a grid-stride loop; this keeps
+    // warps full when individual paths terminate at very different bounce depths
+    // instead of stalling lockstep on the longest path in the warp.
+    //
+    // The host may SPLIT a frame across S dispatches so that no single kernel
+    // launch runs long enough to trip the OS GPU watchdog (~2 s on Windows TDR,
+    // and on Linux for a display-attached GPU), which resets the device and
+    // surfaces as CL_OUT_OF_RESOURCES / CL_INVALID_COMMAND_QUEUE. With G =
+    // get_global_size(0), dispatch s passes pixelStart = s*G and pixelStride =
+    // S*G, so it owns the G-sized pixel blocks q where q % S == s.
+    //
+    // The slices INTERLEAVE rather than partitioning the frame into contiguous
+    // bands, which matters for two reasons:
+    //   - Every pixel is still covered exactly once: for pixel p, write p = q*G
+    //     + r (r < G); it belongs to dispatch s = q % S, work-item r, on loop
+    //     iteration k = q / S. That (s, r, k) is unique, so the slices are a
+    //     partition, not an overlap.
+    //   - Each slice samples the WHOLE image instead of one horizontal band. A
+    //     band of sky costs a fraction of a band of dense terrain, so contiguous
+    //     slices have wildly uneven cost and the host's per-launch time budget —
+    //     which it can only measure as an average — would hide a heavy band that
+    //     alone trips the watchdog. Interleaved slices are cost-uniform, so the
+    //     average IS the worst case.
+    // Coalescing is unaffected: within one iteration the G work-items still read
+    // and write G consecutive pixels.
+    //
+    // gid below is the GLOBAL pixel index in every case, so the RNG seed, the
+    // camera ray and the output slot do not depend on how the frame is sliced —
+    // slicing is bit-exact, not an approximation.
+    int pixelStart,
+    int pixelStride,
     int pixelCount
 
 ) {
+    // The walk's step is pixelStride (= sliceCount * get_global_size(0)), passed
+    // in by the host rather than read from get_global_size here, so that a single
+    // dispatch covers only its own interleaved share of the frame.
     int wid = get_global_id(0);
-    int stride = get_global_size(0);
 
     // Cooperative copy of material palette ints into per-work-group local cache.
     if (matCacheWords > 0) {
@@ -410,6 +501,9 @@ __kernel void render(
     scene.waterShaderParams.baseAmplitude = waterConfig[14];
     scene.waterShaderParams.animationSpeed = waterConfig[15];
     scene.waterOpacity = waterConfig[16];
+    scene.hasWaterBlocks = (waterConfig[17] > 0.5f);
+    scene.waterBounds = AABB_new(waterConfig[18], waterConfig[21], waterConfig[19],
+                                 waterConfig[22], waterConfig[20], waterConfig[23]);
     scene.waterNormalMap = waterNormalMap;
     scene.waterNormalMapW = waterNormalMapW;
 
@@ -476,6 +570,9 @@ __kernel void render(
     // slots 14 and 15). Saves one pow() and one divide per work-item.
     float cachedSunPower = sun.intensityPowGamma;
     float cachedSunLumInv = sun.luminosityInv;
+    // Light for water in-scattering, relative to the default day it was tuned in.
+    float3 waterSunLight = Water_sunLight(sun.color.xyz, cachedSunPower);
+    float waterSkyLight = Water_skyLight((float3)(waterConfig[24], waterConfig[25], waterConfig[26]));
     int gc_cellSize = 0, gc_offsetX = 0, gc_sizeX = 0;
     int gc_offsetY = 0, gc_sizeY = 0, gc_offsetZ = 0, gc_sizeZ = 0;
     if (emittersEnabled && samplingStrategy != 0 && gridConfig[2] > 0) {
@@ -497,7 +594,7 @@ __kernel void render(
     // pixel's path terminates fast (e.g. sky hit) the same work-item picks
     // up the next pixel rather than the warp stalling on the longest-path
     // thread. Empty inner-state per pixel — sumColor/sumAlpha reset.
-    for (int gid = wid; gid < pixelCount; gid += stride) {
+    for (int gid = pixelStart + wid; gid < pixelCount; gid += pixelStride) {
     float3 sumColor = (float3)(0.0f, 0.0f, 0.0f);
     float sumAlpha = 0.0f;
 
@@ -509,7 +606,7 @@ __kernel void render(
         Ray ray = ray_to_camera(camCache, cameraSettings, apertureMask, apertureMaskWidth, gid, random);
 
         ray.material = 0;
-        ray.flags = 0;
+        ray.flags = emittersEnabled ? RAY_EMITTERS : 0;
         ray.currentIor = AIR_IOR;
         ray.prevIor = AIR_IOR;
         ray.inWater = false;
@@ -548,10 +645,14 @@ __kernel void render(
             intersectSky(skyTexture, cachedSkyIntensity, sun, textureAtlas, ray, &skySample, sunDiffuseSun);
             color = skySample.emittance * skySample.color.xyz;
 
-            // CPU: when camera is in water and ray doesn't hit anything,
-            // the result is black (full absorption). Matches ray.color.set(0,0,0,1).
+            // Camera is submerged and the primary ray found nothing — the
+            // unloaded-chunk horizon. CPU sets solid black here
+            // (PathTracer.java:69); return the infinitely-deep-water colour
+            // instead, matching the depth>0 escape above so the horizon and the
+            // bounced light agree instead of meeting at a hard black edge.
             if (ray.inWater) {
-                color = (float3)(0.0f);
+                color = Water_inscatter((float3)(0.0f), scene.waterColor,
+                    Water_scatterLight((float3)(0.0f), dot(ray.direction, sun.sw), waterSunLight, waterSkyLight));
             }
 
             if (fogConfig.mode != FOG_MODE_NONE) {
@@ -626,10 +727,21 @@ __kernel void render(
                         if (!closestIntersect(scene, textureAtlas, bRay, &record, &sample, &material)) {
                             // Sky hit at depth > 0
 
-                            // CPU: when ray is in water and escapes to sky without
-                            // hitting anything, result is black (full absorption).
+                            // Escaped while STILL SUBMERGED: no water surface was
+                            // found. That happens over UNLOADED chunks — the water
+                            // octree has no blocks there and a level or downward ray
+                            // never reaches the water plane. CPU hard-codes this to
+                            // solid black (PathTracer.java:69), which is the black
+                            // horizon. An infinitely deep water column is not black;
+                            // it is the transmittance-0 limit of the fog above, i.e.
+                            // fully saturated in-scattered water colour.
                             if (bRay.inWater) {
+                                branchColor += throughput * Water_inscatter((float3)(0.0f),
+                                    scene.waterColor,
+                                    Water_scatterLight((float3)(0.0f), dot(bRay.direction, sun.sw), waterSunLight, waterSkyLight));
                                 throughput = (float3)(0.0f);
+                                totalWaterDistance = 0.0f;
+                                break;
                             }
 
                             intersectSky(skyTexture, cachedSkyIntensity, sun, textureAtlas, bRay, &sample, sunDiffuseSun);
@@ -675,9 +787,26 @@ __kernel void render(
                         applyBiomeTint(scene, &sample, hitPos);
                     }
 
-                    // Apply water fog attenuation (Beer's law, matching CPU).
+                    // Water fog: per-channel absorption PLUS in-scattering.
+                    // The absorption half is Beer's law as before but tinted, so
+                    // depth reads blue-green. The in-scatter half is the new part
+                    // and the reason underwater no longer decays to black: light
+                    // the segment removed is partly returned as a water-coloured
+                    // haze. Computed inline from values already in SceneConfig —
+                    // memory §14 reverted an earlier attempt at this because a
+                    // persistent float3 in the depth loop blew the register budget
+                    // and crashed with CL_OUT_OF_RESOURCES. Do NOT hoist these.
                     if (totalWaterDistance > 0.0f) {
-                        float fogAtt = Water_fogAttenuation(totalWaterDistance, scene.waterVisibility);
+                        float3 fogAtt = Water_extinction(totalWaterDistance, scene.waterVisibility);
+                        // Sample the sunlight actually reaching a random point
+                        // inside this water segment, the same way layered ground
+                        // fog samples its scatter point. This is what makes depth
+                        // darken by itself and puts shafts behind geometry.
+                        float3 wScatterPos = bRay.origin + bRay.direction * (record.distance * Random_nextFloat(random));
+                        float3 wSunAtt = getDirectLightAttenuation(scene, textureAtlas,
+                            wScatterPos, sun.sw, FOG_LIMIT, strictDirectLight);
+                        branchColor += throughput * Water_inscatter(fogAtt, scene.waterColor,
+                            Water_scatterLight(wSunAtt, dot(bRay.direction, sun.sw), waterSunLight, waterSkyLight));
                         throughput *= fogAtt;
                         totalWaterDistance = 0.0f;
                     }
@@ -785,12 +914,8 @@ __kernel void render(
                                         bool shadowClear = !closestIntersect(scene, textureAtlas, shadow, &srec, &sMatSample, &sSample);
                                         if (shadowClear || srec.distance >= dist - 1e-4f) {
                                             if (shadowClear) {
-                                                // Emitter invisible to rays (light block): look up material from octree
-                                                int bd = Octree_get(&scene.octree, ex, ey, ez);
-                                                if (bd > 0) {
-                                                    Material em = Material_get(scene.materialPalette, scene.blockPalette.blockPalette[bd + 1]);
-                                                    Material_sample(em, textureAtlas, (float2)(ru, rv), &sMatSample);
-                                                }
+                                                Emitter_sampleCell(scene.blockPalette, scene.materialPalette, textureAtlas, &scene.octree,
+                                                                   ex, ey, ez, (float2)(ru, rv), &sMatSample);
                                                 srec.normal = (face < 2) ? (float3)(face == 0 ? -1.0f : 1.0f, 0, 0)
                                                             : (face < 4) ? (float3)(0, face == 2 ? -1.0f : 1.0f, 0)
                                                                          : (float3)(0, 0, face == 4 ? -1.0f : 1.0f);
@@ -842,11 +967,8 @@ __kernel void render(
                                         bool shadowClear = !closestIntersect(scene, textureAtlas, shadow, &srec, &sMatSample, &sSample);
                                         if (shadowClear || srec.distance >= dist - 1e-4f) {
                                             if (shadowClear) {
-                                                int bd = Octree_get(&scene.octree, ex, ey, ez);
-                                                if (bd > 0) {
-                                                    Material em = Material_get(scene.materialPalette, scene.blockPalette.blockPalette[bd + 1]);
-                                                    Material_sample(em, textureAtlas, (float2)(ru, rv), &sMatSample);
-                                                }
+                                                Emitter_sampleCell(scene.blockPalette, scene.materialPalette, textureAtlas, &scene.octree,
+                                                                   ex, ey, ez, (float2)(ru, rv), &sMatSample);
                                                 srec.normal = (face < 2) ? (float3)(face == 0 ? -1.0f : 1.0f, 0, 0)
                                                             : (face < 4) ? (float3)(0, face == 2 ? -1.0f : 1.0f, 0)
                                                                          : (float3)(0, 0, face == 4 ? -1.0f : 1.0f);
@@ -895,11 +1017,8 @@ __kernel void render(
                                             bool shadowClear = !closestIntersect(scene, textureAtlas, shadow, &srec, &sMatSample, &sSample);
                                             if (shadowClear || srec.distance >= dist - 1e-4f) {
                                                 if (shadowClear) {
-                                                    int bd = Octree_get(&scene.octree, ex, ey, ez);
-                                                    if (bd > 0) {
-                                                        Material em = Material_get(scene.materialPalette, scene.blockPalette.blockPalette[bd + 1]);
-                                                        Material_sample(em, textureAtlas, (float2)(ru, rv), &sMatSample);
-                                                    }
+                                                    Emitter_sampleCell(scene.blockPalette, scene.materialPalette, textureAtlas, &scene.octree,
+                                                                       ex, ey, ez, (float2)(ru, rv), &sMatSample);
                                                     srec.normal = (face < 2) ? (float3)(face == 0 ? -1.0f : 1.0f, 0, 0)
                                                                 : (face < 4) ? (float3)(0, face == 2 ? -1.0f : 1.0f, 0)
                                                                              : (float3)(0, 0, face == 4 ? -1.0f : 1.0f);
@@ -969,7 +1088,18 @@ __kernel void render(
                         bRay.prevIor = bRay.currentIor;
                         bRay.currentIor = pdfSample.newIor;
                         bRay.inWater = sample.isWater ? !bRay.inWater : bRay.inWater;
-                        if (pdfSample.newIor > AIR_IOR + EPS) {
+                        // Seed the octree DDA with the block we just entered so the
+                        // far side of a contiguous run of it is not drawn. This is
+                        // NOT gated on IOR: CPU culls by block identity, so a
+                        // non-refractive translucent block (leaves, copper grates,
+                        // cauldrons, spawner, lava) must cull too. blockData is 0 for
+                        // entity/BVH hits (IntersectionRecord_new), which is air —
+                        // i.e. no medium — so those need no special case. Restricted
+                        // to full cubes (plus the original refractive case, which
+                        // covers panes and water): claiming a MODEL block as the
+                        // medium would make the DDA skip the rest of its geometry.
+                        if (pdfSample.newIor > AIR_IOR + EPS
+                                || BlockPalette_isFullCube(scene.blockPalette, record.blockData)) {
                             bRay.material = record.blockData;
                         } else {
                             bRay.material = 0;
@@ -1004,10 +1134,19 @@ __kernel void render(
                     }
                 } // end depth loop
 
-                // Apply remaining water fog if ray ended while still in water
+                // Leftover water fog. In practice this only fires when
+                // effectiveDepth == 0 (i.e. rayDepth = 1): every other exit from
+                // the depth loop has already consumed and zeroed
+                // totalWaterDistance in the same iteration that accumulated it.
+                // Deliberately AMBIENT-ONLY — no sun sample. Spending another
+                // getDirectLightAttenuation (and its register budget, see §14) on
+                // a degenerate one-bounce render is not worth it; the trade is
+                // that rayDepth = 1 underwater renders darker than rayDepth >= 2.
                 if (totalWaterDistance > 0.0f) {
-                    float fogAtt = Water_fogAttenuation(totalWaterDistance, scene.waterVisibility);
+                    float3 fogAtt = Water_extinction(totalWaterDistance, scene.waterVisibility);
                     branchColor *= fogAtt;
+                    branchColor += throughput * Water_inscatter(fogAtt, scene.waterColor,
+                        Water_scatterLight((float3)(0.0f), dot(bRay.direction, sun.sw), waterSunLight, waterSkyLight));
                 }
 
                 // Apply ground fog. Use scene entry point as fog origin so
@@ -1132,6 +1271,9 @@ __kernel void preview(
     scene.useCustomWaterColor = (waterConfig[10] > 0.5f);
     scene.waterIor = waterConfig[11];
     scene.waterOpacity = waterConfig[16];
+    scene.hasWaterBlocks = (waterConfig[17] > 0.5f);
+    scene.waterBounds = AABB_new(waterConfig[18], waterConfig[21], waterConfig[19],
+                                 waterConfig[22], waterConfig[20], waterConfig[23]);
     scene.chunkBitmap = chunkBitmap;
     scene.chunkBitmapSize = chunkBitmapSize;
     scene.biomeColorsEnabled = (biomeDataSize > 0);

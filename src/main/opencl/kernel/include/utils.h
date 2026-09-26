@@ -9,7 +9,11 @@ float4 colorFromArgb(unsigned int argb) {
     color.x = (argb >> 16) & 0xFF;
     color.y = (argb >> 8) & 0xFF;
     color.z = argb & 0xFF;
-    color /= 256.0f;
+    // 255, not 256: the host packs with ColorUtil.getRGB (x * 255 + .5), and
+    // Chunky unpacks with / 255 too. Dividing by 256 made every packed colour 0.4%
+    // dark and capped alpha at 255/256, so nothing untextured or tinted was ever
+    // fully opaque.
+    color /= 255.0f;
     return color;
 }
 

@@ -221,7 +221,7 @@ TexturedAABB TexturedAABB_new(__global const int* aabbModels, int index) {
     return b;
 }
 
-bool TexturedAABB_intersect(TexturedAABB self, image2d_array_t atlas, MaterialPalette materialPalette, Ray ray, IntersectionRecord* record, MaterialSample* sample) {
+bool TexturedAABB_intersect(TexturedAABB self, image2d_array_t atlas, MaterialPalette materialPalette, Ray ray, IntersectionRecord* record) {
     IntersectionRecord tempRecord = *record;
 
     bool hit = AABB_full_intersect_map_2(self.box, ray, &tempRecord);
@@ -271,8 +271,9 @@ bool TexturedAABB_intersect(TexturedAABB self, image2d_array_t atlas, MaterialPa
     }
 
     Material material = Material_get(materialPalette, tempRecord.material);
-    if (Material_sample(material, atlas, tempRecord.texCoord, sample)) {
+    if (Material_alphaTest(material, atlas, tempRecord.texCoord)) {
         tempRecord.blockData = 0;  // AABB models are not octree blocks
+        tempRecord.hitKind = HIT_MATERIAL;
         *record = tempRecord;
         return true;
     } else {
@@ -316,7 +317,7 @@ Quad Quad_new(__global const int* quadModels, int index) {
     return q;
 }
 
-bool Quad_intersect(Quad self, image2d_array_t atlas, MaterialPalette materialPalette, Ray ray, IntersectionRecord* record, MaterialSample* sample) {
+bool Quad_intersect(Quad self, image2d_array_t atlas, MaterialPalette materialPalette, Ray ray, IntersectionRecord* record) {
     float3 n = normalize(cross(self.xv, self.yv));
     bool doubleSided = self.flags & 1;
     
@@ -331,13 +332,14 @@ bool Quad_intersect(Quad self, image2d_array_t atlas, MaterialPalette materialPa
             if (u >= 0 && u <= 1 && v >= 0 && v <= 1) {
                 float2 texCoord = (float2) (self.uv.x + (u * self.uv.y), self.uv.z + (v * self.uv.w));
                 Material material = Material_get(materialPalette, self.material);
-                if (Material_sample(material, atlas, texCoord, sample)) {
+                if (Material_alphaTest(material, atlas, texCoord)) {
                     record->texCoord = texCoord;
                     // Flip normal to face the ray for double-sided quads (matching CPU orientNormal)
                     record->normal = (doubleSided && denom > 0) ? -n : n;
                     record->distance = t;
                     record->material = self.material;
                     record->blockData = 0;  // Quad models are not octree blocks
+                    record->hitKind = HIT_MATERIAL;
                     return true;
                 }
             }
@@ -394,7 +396,7 @@ Triangle Triangle_new(__global const int* trigModels, int index) {
     return t;
 }
 
-bool Triangle_intersect(Triangle self, image2d_array_t atlas, MaterialPalette materialPalette, Ray ray, IntersectionRecord* record, MaterialSample* sample) {
+bool Triangle_intersect(Triangle self, image2d_array_t atlas, MaterialPalette materialPalette, Ray ray, IntersectionRecord* record) {
     float3 pvec, qvec, tvec;
 
     pvec = cross(ray.direction, self.e2);
@@ -431,11 +433,12 @@ bool Triangle_intersect(Triangle self, image2d_array_t atlas, MaterialPalette ma
         );
 
         Material material = Material_get(materialPalette, self.material);
-        if (Material_sample(material, atlas, texCoord, sample)) {
+        if (Material_alphaTest(material, atlas, texCoord)) {
             record->texCoord = texCoord;
             record->normal = self.n;
             record->material = self.material;
             record->blockData = 0;  // BVH entities are not octree blocks
+            record->hitKind = HIT_MATERIAL;
             record->distance = t;
             return true;
         }

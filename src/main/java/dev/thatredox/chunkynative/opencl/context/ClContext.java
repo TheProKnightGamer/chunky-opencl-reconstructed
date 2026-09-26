@@ -30,6 +30,27 @@ public class ClContext {
     private static final String COMPILE_OPTIONS = "-cl-std=CL1.2 -Werror -cl-mad-enable -cl-no-signed-zeros";
     private static final String LINK_OPTIONS = "";
 
+    /**
+     * Register cap for the NVIDIA compiler. Left alone, it gives the render kernel
+     * all 255 registers, which fits only 8 warps on an SM and still spills. Capping
+     * it trades a few more spills for twice the resident warps, and on an RTX 3070
+     * the render kernel ran 1.26x-1.4x faster at 128 (measured against 64-255).
+     * Override with -Dchunkycl.nvMaxRegisters=N; 0 leaves the compiler's choice.
+     */
+    private static final int DEFAULT_NV_MAX_REGISTERS = 128;
+
+    /**
+     * Device-specific code-generation options. NVIDIA generates machine code
+     * (ptxas) when a program is LINKED or built from a cached binary, not when it
+     * is compiled, so these must reach every one of those calls: passed to
+     * clCompileProgram alone they are silently ignored.
+     */
+    private final String deviceOptions;
+    /** COMPILE_OPTIONS plus the device options. Part of the binary-cache key. */
+    private final String compileOptions;
+    /** LINK_OPTIONS plus the device options. Part of the binary-cache key. */
+    private final String linkOptions;
+
     public ClContext(Device device) {
         this.device = device;
         this.deviceArray = new cl_device_id[] { device.device };
@@ -40,12 +61,21 @@ public class ClContext {
 
 
         this.queue = createCommandQueue();
+        this.deviceOptions = deviceOptionsFor(device).trim();
+        this.compileOptions = (COMPILE_OPTIONS + " " + deviceOptions).trim();
+        this.linkOptions = (LINK_OPTIONS + " " + deviceOptions).trim();
 
         // Check if version is behind
         int[] version = device.version();
         if (version[0] <= 1 && version[1] < 2) {
             Log.error("OpenCL 1.2+ required.");
         }
+    }
+
+    private static String deviceOptionsFor(Device device) {
+        if (!device.supportsNvCompilerOptions()) return "";
+        int maxRegisters = Integer.getInteger("chunkycl.nvMaxRegisters", DEFAULT_NV_MAX_REGISTERS);
+        return maxRegisters > 0 ? " -cl-nv-maxrregcount=" + maxRegisters : "";
     }
 
     /**
@@ -156,7 +186,7 @@ public class ClContext {
             String[] headerNamesArg = numHeaders == 0 ? null : includeNames;
             int code;
             try {
-                code = clCompileProgram(kernelProgram, 1, deviceArray, COMPILE_OPTIONS,
+                code = clCompileProgram(kernelProgram, 1, deviceArray, compileOptions,
                         numHeaders, headersArg, headerNamesArg, null, null);
             } catch (CLException e) {
                 // Another thread may have re-enabled JOCL's global exceptions
@@ -218,7 +248,7 @@ public class ClContext {
             }
 
             int[] linkStatus = new int[1];
-            linked = clLinkProgram(context, 1, deviceArray, LINK_OPTIONS, 1,
+            linked = clLinkProgram(context, 1, deviceArray, linkOptions, 1,
                     new cl_program[] { kernelProgram }, null, null, linkStatus);
             if (linked == null || linkStatus[0] != CL_SUCCESS) {
                 throw new RuntimeException("Failed to link CL program " + kernelName + ": code " + linkStatus[0]);
@@ -253,8 +283,8 @@ public class ClContext {
             digest.update(device.name().getBytes(StandardCharsets.UTF_8));
             digest.update(device.versionString().getBytes(StandardCharsets.UTF_8));
             digest.update(getDriverVersion().getBytes(StandardCharsets.UTF_8));
-            digest.update(COMPILE_OPTIONS.getBytes(StandardCharsets.UTF_8));
-            digest.update(LINK_OPTIONS.getBytes(StandardCharsets.UTF_8));
+            digest.update(compileOptions.getBytes(StandardCharsets.UTF_8));
+            digest.update(linkOptions.getBytes(StandardCharsets.UTF_8));
             for (Map.Entry<String, String> entry : allSources.entrySet()) {
                 digest.update(entry.getKey().getBytes(StandardCharsets.UTF_8));
                 digest.update(entry.getValue().getBytes(StandardCharsets.UTF_8));
@@ -310,7 +340,7 @@ public class ClContext {
                 return null;
             }
 
-            int code = clBuildProgram(program, 1, deviceArray, "", null, null);
+            int code = clBuildProgram(program, 1, deviceArray, deviceOptions, null, null);
             CL.setExceptionsEnabled(true);
 
             if (code != CL_SUCCESS) {
