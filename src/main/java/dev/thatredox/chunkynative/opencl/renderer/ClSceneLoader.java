@@ -47,6 +47,8 @@ public class ClSceneLoader extends AbstractSceneLoader {
     protected ClIntBuffer octreeDepth = null;
     protected ClIntBuffer waterOctreeData = null;
     protected ClIntBuffer waterOctreeDepth = null;
+    /** Water-octree leaf bounds (see {@link #leafBounds}); null when there is no water. */
+    protected int[] waterBounds = null;
     protected ClIntBuffer emitterPositions = null;
     protected ClIntBuffer positionIndexes = null;
     protected ClIntBuffer constructedGrid = null;
@@ -222,12 +224,15 @@ public class ClSceneLoader extends AbstractSceneLoader {
         }
 
         // Export fog, water, render config, cloud data, and water normal map buffers
+        // Biome data first: it sets biomeYLevels, which exportRenderConfig passes to the
+        // kernel. The other way round, a new scene's biome buffer was paired with the
+        // previous scene's level count, and applyBiomeTint read far past the buffer.
+        exportBiomeData(scene);
         exportFogConfig(scene);
         exportWaterConfig(scene);
         exportRenderConfig(scene);
         exportCloudData();
         exportWaterNormalMap();
-        exportBiomeData(scene);
         exportChunkBitmap(scene);
 
         return loadSuccess;
@@ -280,7 +285,9 @@ public class ClSceneLoader extends AbstractSceneLoader {
         // waterConfig layout: [enabled, height, chunkClip, octreeSize, shadingStrategy,
         //                       animationTime, visibility, r, g, b, useCustomColor, ior,
         //                       shaderIterations, shaderFrequency, shaderAmplitude, shaderSpeed,
-        //                       waterOpacity]
+        //                       waterOpacity, hasWaterBlocks, waterMinX, waterMinY, waterMinZ,
+        //                       waterMaxX, waterMaxY, waterMaxZ, skyAmbientR, skyAmbientG,
+        //                       skyAmbientB]
         int octreeSize = 1 << scene.getWorldOctree().getDepth();
         WaterShadingStrategy waterStrategy = scene.getWaterShadingStrategy();
 
@@ -306,7 +313,7 @@ public class ClSceneLoader extends AbstractSceneLoader {
         }
 
         Vector3 waterColor = scene.getWaterColor();
-        float[] waterData = new float[17];
+        float[] waterData = new float[27];
         waterData[0] = scene.isWaterPlaneEnabled() ? 1.0f : 0.0f;
         // Convert water plane height from world-space to octree-local-space.
         // The GPU kernel operates in octree-local coordinates where scene origin
@@ -327,6 +334,18 @@ public class ClSceneLoader extends AbstractSceneLoader {
         waterData[14] = shaderAmplitude;
         waterData[15] = shaderSpeed;
         waterData[16] = (float) scene.getWaterOpacity();
+        // Bounds of the water octree's blocks. The kernel skips its water-octree
+        // march for rays that cannot reach this box, which is most of them: every
+        // ray above the water line, and every shadow ray climbing toward the sun.
+        if (waterBounds != null) {
+            waterData[17] = 1.0f;
+            for (int i = 0; i < 6; i++) waterData[18 + i] = waterBounds[i];
+        }
+        // The skylight lighting the water's in-scattering, so it follows the real sky
+        // (dark at night) instead of a fixed glow. See ClSky.skyAmbient.
+        if (clSky != null) {
+            for (int i = 0; i < 3; i++) waterData[24 + i] = clSky.skyAmbient[i];
+        }
 
         if (!Arrays.equals(waterData, prevWaterData)) {
             prevWaterData = waterData;
@@ -470,7 +489,10 @@ public class ClSceneLoader extends AbstractSceneLoader {
         biomeDataSize = octreeSize;
         biomeYLevels = yLevels;
 
-        // Layout: 4 ints per (yLevel, x, z): [grass, foliage, water, dryFoliage]
+        // Layout: 4 ints per (yLevel, x, z) in material tint-tag order, because the
+        // kernel reads slot (tintType - 1): [foliage (1), grass (2), water (3),
+        // dryFoliage (4)] — see PackedMaterial.getTint. (Grass and foliage used to be
+        // stored the other way round, so leaves got the grass colour and vice versa.)
         // Index: (yLevel * octreeSize * octreeSize + z * octreeSize + x) * 4
         int arraySize = octreeSize * yLevels * octreeSize * 4;
         int defaultBiome = packLinearRgb(scene.getGrassColor(0, 0, 0));
@@ -479,8 +501,8 @@ public class ClSceneLoader extends AbstractSceneLoader {
         int defaultDryFoliage = packLinearRgb(scene.getDryFoliageColor(0, 0, 0));
         int[] biomeData = new int[arraySize];
         for (int i = 0; i < biomeData.length; i += 4) {
-            biomeData[i]     = defaultBiome;
-            biomeData[i + 1] = defaultFoliage;
+            biomeData[i]     = defaultFoliage;
+            biomeData[i + 1] = defaultBiome;
             biomeData[i + 2] = defaultWater;
             biomeData[i + 3] = defaultDryFoliage;
         }
@@ -503,8 +525,8 @@ public class ClSceneLoader extends AbstractSceneLoader {
                         float[] foliage = scene.getFoliageColor(x, y, z);
                         float[] water = scene.getWaterColor(x, y, z);
                         float[] dryFoliage = scene.getDryFoliageColor(x, y, z);
-                        biomeData[base]     = packLinearRgb(grass);
-                        biomeData[base + 1] = packLinearRgb(foliage);
+                        biomeData[base]     = packLinearRgb(foliage);
+                        biomeData[base + 1] = packLinearRgb(grass);
                         biomeData[base + 2] = packLinearRgb(water);
                         biomeData[base + 3] = packLinearRgb(dryFoliage);
                     }
@@ -564,13 +586,11 @@ public class ClSceneLoader extends AbstractSceneLoader {
     }
 
     @Override
-    protected boolean loadOctree(int[] octree, int depth, int[] blockMapping, ResourcePalette<PackedBlock> blockPalette) {
+    protected boolean loadOctree(int[] octree, int depth, int[] blockMapping, int anyTypeBlock, ResourcePalette<PackedBlock> blockPalette) {
         if (octreeData != null) octreeData.close();
         if (octreeDepth != null) octreeDepth.close();
 
-        int[] mappedOctree = Arrays.stream(octree)
-                .map(i -> i > 0 || -i >= blockMapping.length ? i : -blockMapping[-i])
-                .toArray();
+        int[] mappedOctree = mapOctree(octree, blockMapping, anyTypeBlock);
         octreeData = new ClIntBuffer(mappedOctree, context);
         octreeDepth = new ClIntBuffer(depth, context);
 
@@ -578,17 +598,49 @@ public class ClSceneLoader extends AbstractSceneLoader {
     }
 
     @Override
-    protected boolean loadWaterOctree(int[] waterOctree, int depth, int[] blockMapping, ResourcePalette<PackedBlock> blockPalette) {
+    protected boolean loadWaterOctree(int[] waterOctree, int depth, int[] blockMapping, int anyTypeBlock, ResourcePalette<PackedBlock> blockPalette) {
         if (waterOctreeData != null) waterOctreeData.close();
         if (waterOctreeDepth != null) waterOctreeDepth.close();
+        waterBounds = leafBounds(waterOctree, depth);
 
-        int[] mappedOctree = Arrays.stream(waterOctree)
-                .map(i -> i > 0 || -i >= blockMapping.length ? i : -blockMapping[-i])
-                .toArray();
+        int[] mappedOctree = mapOctree(waterOctree, blockMapping, anyTypeBlock);
         waterOctreeData = new ClIntBuffer(mappedOctree, context);
         waterOctreeDepth = new ClIntBuffer(depth, context);
 
         return true;
+    }
+
+    /**
+     * Bounding box, in octree-local block coordinates, of every non-empty leaf of a
+     * packed octree: {minX, minY, minZ, maxX, maxY, maxZ}, or null if it is empty.
+     * Child c of a branch covers bit (c >> 2) of x, (c >> 1) of y and c of z, the
+     * same layout the kernel's descent uses.
+     */
+    static int[] leafBounds(int[] tree, int depth) {
+        int[] b = {Integer.MAX_VALUE, Integer.MAX_VALUE, Integer.MAX_VALUE,
+                Integer.MIN_VALUE, Integer.MIN_VALUE, Integer.MIN_VALUE};
+        // Explicit stack of (node word, x, y, z, level); at most 7 * depth + 1 deep.
+        int[] stack = new int[5 * (8 * (depth + 1))];
+        int sp = 0;
+        stack[sp++] = tree[0]; stack[sp++] = 0; stack[sp++] = 0; stack[sp++] = 0; stack[sp++] = depth;
+        while (sp > 0) {
+            int level = stack[--sp], z = stack[--sp], y = stack[--sp], x = stack[--sp], node = stack[--sp];
+            if (node > 0 && level > 0) {
+                int half = 1 << (level - 1);
+                for (int c = 0; c < 8; c++) {
+                    stack[sp++] = tree[node + c];
+                    stack[sp++] = x + (((c >> 2) & 1) * half);
+                    stack[sp++] = y + (((c >> 1) & 1) * half);
+                    stack[sp++] = z + ((c & 1) * half);
+                    stack[sp++] = level - 1;
+                }
+            } else if (node != 0) {
+                int size = 1 << level;
+                b[0] = Math.min(b[0], x); b[1] = Math.min(b[1], y); b[2] = Math.min(b[2], z);
+                b[3] = Math.max(b[3], x + size); b[4] = Math.max(b[4], y + size); b[5] = Math.max(b[5], z + size);
+            }
+        }
+        return b[0] == Integer.MAX_VALUE ? null : b;
     }
 
     @Override

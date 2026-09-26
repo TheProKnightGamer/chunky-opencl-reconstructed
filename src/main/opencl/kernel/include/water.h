@@ -173,12 +173,163 @@ bool Water_planeIntersect(Ray ray, float waterPlaneHeight, float octreeSize, boo
     return true;
 }
 
-// Apply water fog attenuation (exponential falloff based on distance in water).
-// Matches CPU Beer's law: attenuation = exp(-distance / waterVisibility).
-float Water_fogAttenuation(float distance, float waterVisibility) {
-    if (waterVisibility <= 0) return 0.0f;
+// ===========================================================================
+//  Water volume optics
+// ---------------------------------------------------------------------------
+//  These DIVERGE from Chunky's CPU renderer on purpose. CPU water fog is a
+//  single monochrome Beer's-law term, exp(-d / waterVisibility), with no
+//  scattering at all — so the only thing water can ever do to a ray is subtract
+//  from it, and every underwater path decays to black. That is the "rays die
+//  off" this replaces.
+// ===========================================================================
+
+// Per-channel extinction, expressed RELATIVE to the user's waterVisibility.
+// Clear water absorbs red several times faster than blue, and that imbalance is
+// the entire reason deep water reads blue-green rather than neutral grey.
+// RED is pinned to 1.0 so waterVisibility keeps its original meaning — red still
+// falls off as exp(-d / waterVisibility) — and only the colour balance is new.
+#define WATER_EXTINCTION_R 1.00f
+#define WATER_EXTINCTION_G 0.42f
+#define WATER_EXTINCTION_B 0.26f
+
+// Strength of scattering: what fraction of extinguished light comes back into
+// the path instead of being absorbed. 0.0 reproduces the old pure-absorption
+// behaviour (fade to black). This is the master "how murky" knob.
+#define WATER_SCATTER_STRENGTH 0.55f
+
+// Henyey-Greenstein anisotropy. Water scatters strongly FORWARD, which is why
+// looking toward the sun underwater is a bright haze and looking away is dim and
+// flat. 0.0 is isotropic (the dead, uniformly-tinted look).
+#define WATER_SCATTER_G 0.35f
+
+// Ceiling on the phase function. Guards against a hot firefly when a path looks
+// straight down the sun vector through a long water segment.
+#define WATER_PHASE_MAX 3.0f
+
+// Isotropic skylight permeating the water, under the directional sun term.
+// This is NOT a token epsilon: it is the only thing lighting water the sun
+// cannot reach, so it sets how bright shadowed water AND the deep-water horizon
+// are. It is the level for Chunky's default DAYTIME sky: the kernel scales it by
+// the scene's actual skylight (Water_skyLight), so night water goes dark instead
+// of glowing.
+//
+// >>> RAISE THIS FIRST if the underwater horizon still reads as too dark. <<<
+// Not phase-modulated, by definition — ambient is directionless.
+#define WATER_AMBIENT 0.35f
+
+// The light the tuning above was done in: Chunky's defaults. Luminance of the
+// skylight its default sky gives an upward-facing surface (simulated sky, sun 60
+// degrees up; ClSky.skyAmbient = 0.211, 0.424, 0.691), and the default sun's
+// intensity^2.2 (1.25^2.2). A default scene therefore looks exactly as tuned, and
+// every other sky, time of day or sun setting scales from it.
+#define WATER_DAY_SKY_LUMINANCE 0.398f
+#define WATER_DAY_SUN_POWER 1.6338f
+
+// Caustic contrast. 1.0 is the raw projected-area ratio; higher tightens the
+// bright bands. Paired with WATER_CAUSTIC_MAX, which caps how much a single wave
+// facet may concentrate the sun (energy guard — see Water_causticFactor).
+#define WATER_CAUSTIC_SHARPNESS 2.0f
+#define WATER_CAUSTIC_MAX       2.5f
+
+// Fallback scattering albedo for a colourless water setting (clear open water).
+#define WATER_ALBEDO_FALLBACK ((float3)(0.12f, 0.45f, 0.62f))
+
+// Transmittance of a water segment, per colour channel.
+float3 Water_extinction(float distance, float waterVisibility) {
+    if (waterVisibility <= 0) return (float3)(0.0f);
     float a = distance / waterVisibility;
-    return exp(-a);
+    return exp(-a * (float3)(WATER_EXTINCTION_R, WATER_EXTINCTION_G, WATER_EXTINCTION_B));
+}
+
+// Scattering albedo, derived from the scene's water colour by keeping its HUE
+// and renormalising its MAGNITUDE.
+//
+// This renormalisation is essential, not cosmetic. Chunky's waterColor is an
+// ABSORPTION tint and its default is (0.03, 0.13, 0.16) — very dark. Feeding
+// that in directly as a scattering albedo makes in-scattered light about 6x too
+// dim and every underwater scene still reads as black, which is the exact bug
+// this section exists to fix. Dividing by the max channel keeps the user's
+// colour choice meaningful while decoupling brightness from it, so the two
+// concerns stay independently tunable.
+float3 Water_scatterAlbedo(float3 waterColor) {
+    float m = fmax(waterColor.x, fmax(waterColor.y, waterColor.z));
+    if (m < 1e-4f) return WATER_ALBEDO_FALLBACK;
+    return waterColor / m;
+}
+
+// Henyey-Greenstein phase function, normalised so g = 0 returns exactly 1.0.
+// That normalisation matters: it keeps overall brightness independent of the
+// anisotropy knob, so WATER_SCATTER_G can be tuned for LOOK without also having
+// to re-tune WATER_SCATTER_STRENGTH for exposure.
+// cosTheta is dot(viewDir, sunDir), so +1 means looking straight at the sun.
+float Water_phase(float cosTheta) {
+    float g2 = WATER_SCATTER_G * WATER_SCATTER_G;
+    float d = 1.0f + g2 - 2.0f * WATER_SCATTER_G * cosTheta;
+    d = fmax(d, 1e-4f);
+    return clamp((1.0f - g2) / (d * sqrt(d)), 0.0f, WATER_PHASE_MAX);
+}
+
+// Radiance scattered INTO a segment with the given transmittance. Whatever the
+// segment removed (1 - transmittance) partly comes back, tinted by the water's
+// scattering albedo, so thick water settles to a lit haze rather than to black.
+//
+// `light` is the ACTUAL sunlight reaching a point inside the segment, not a flat
+// constant. That is what buys the realism: because the shadow ray that produced
+// it was itself attenuated by Water_extinction on the way down, deep water
+// darkens on its own, shafts appear behind geometry, and the caustic modulation
+// carries into the volume — none of which needs to be faked separately.
+float3 Water_inscatter(float3 transmittance, float3 waterColor, float3 light) {
+    return ((float3)(1.0f) - transmittance) * Water_scatterAlbedo(waterColor)
+         * light * WATER_SCATTER_STRENGTH;
+}
+
+// Scene skylight relative to the default day (1.0 = the tuning's sky; ~0 at night).
+// skyAmbient is ClSky.skyAmbient, passed in waterConfig[24..26].
+float Water_skyLight(float3 skyAmbient) {
+    return dot(skyAmbient, (float3)(0.2126f, 0.7152f, 0.0722f)) / WATER_DAY_SKY_LUMINANCE;
+}
+
+// Sun colour and power relative to the default sun (white, intensity 1.25).
+float3 Water_sunLight(float3 sunColor, float sunPowGamma) {
+    return sunColor * (sunPowGamma / WATER_DAY_SUN_POWER);
+}
+
+// The light term for Water_inscatter: the sun's light (colour and power, times
+// its visibility from inside the water) shaped by the phase function, over the
+// isotropic skylight floor scaled to the scene's actual sky.
+float3 Water_scatterLight(float3 sunAttenuation, float cosTheta, float3 sunLight, float skyLight) {
+    return sunAttenuation * sunLight * Water_phase(cosTheta) + (float3)(WATER_AMBIENT * skyLight);
+}
+
+// Wave normal at a world XZ position, without an IntersectionRecord.
+// Shadow rays deliberately SKIP wave shading for CPU parity (see kernel.h), so
+// the caustic term cannot read a perturbed record->normal and has to sample the
+// wave field itself. Reuses Water_applyShading so caustics can never drift out
+// of step with the surface the user actually sees.
+float3 Water_waveNormal(int waterShadingStrategy, float animationTime,
+                        float wx, float wz, WaterShaderParams params,
+                        __global const float* waterNormalMap, int waterNormalMapW) {
+    IntersectionRecord probe;
+    probe.normal = (float3)(0.0f, 1.0f, 0.0f);
+    Water_applyShading(&probe, waterShadingStrategy, animationTime, wx, wz,
+                       params, waterNormalMap, waterNormalMapW);
+    return probe.normal;
+}
+
+// Focusing factor for sunlight crossing a wavy surface — the caustic term.
+// The surface is a lens: a facet tilted to face the sun gathers a wider slice of
+// the beam and concentrates it below, one tilted away spreads it out. Comparing
+// the facet's projected area against flat water gives that ratio directly, which
+// is why the bright bands track the SAME simplex noise that shapes the surface.
+//
+// This is a cheap approximation, NOT a photon-mapped caustic: it is stable, and
+// clamped so a near-grazing sun cannot divide by ~0 and flare the whole seabed.
+float Water_causticFactor(float3 waveNormal, float3 sunDir) {
+    float flatCos = fabs(sunDir.y);
+    if (flatCos < 1e-3f) return 1.0f;  // sun on the horizon: no meaningful focus
+    float waveCos = fabs(dot(sunDir, waveNormal));
+    float ratio = clamp(waveCos / flatCos, 0.0f, WATER_CAUSTIC_MAX);
+    return pow(ratio, WATER_CAUSTIC_SHARPNESS);
 }
 
 #endif

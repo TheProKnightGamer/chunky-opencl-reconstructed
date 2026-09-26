@@ -20,6 +20,13 @@ import java.lang.reflect.Field;
 public class ClSky implements AutoCloseable {
     public final ClMemory skyTexture;
     public final ClMemory skyIntensity;
+    /**
+     * Linear RGB skylight on an upward-facing surface, as the equivalent uniform sky
+     * radiance: the cosine-weighted average of the baked upper hemisphere. Bright blue
+     * at noon, near black at night, and it follows skymaps and the sky-light setting.
+     * The kernel lights water in-scattering with it.
+     */
+    public final float[] skyAmbient = new float[3];
     private final ClContext context;
 
     public ClSky(Scene scene, ClContext context) {
@@ -45,6 +52,8 @@ public class ClSky implements AutoCloseable {
         desc.image_height = textureResolution;
 
         float[] texture = new float[textureResolution * textureResolution * 4];
+        double[] ambient = new double[3];
+        double ambientWeight = 0;
         Ray ray = new Ray();
         for (int i = 0; i < textureResolution; i++) {
             for (int j = 0; j < textureResolution; j++) {
@@ -76,7 +85,20 @@ public class ClSky implements AutoCloseable {
                 texture[offset + 1] = (float) ray.color.y;
                 texture[offset + 2] = (float) ray.color.z;
                 texture[offset + 3] = 1.0f;
+
+                // Upper hemisphere, weighted by solid angle (cos phi) and by the
+                // cosine to the zenith (sin phi).
+                if (phi > 0) {
+                    double w = FastMath.sin(phi) * r;
+                    ambient[0] += ray.color.x * w;
+                    ambient[1] += ray.color.y * w;
+                    ambient[2] += ray.color.z * w;
+                    ambientWeight += w;
+                }
             }
+        }
+        for (int c = 0; c < 3; c++) {
+            skyAmbient[c] = ambientWeight > 0 ? (float) (ambient[c] / ambientWeight) : 0.0f;
         }
 
         this.skyTexture = new ClMemory(clCreateImage(context.context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,

@@ -27,6 +27,31 @@ BlockPalette BlockPalette_new(__global const int* blockPalette, __global const i
     return p;
 }
 
+// True if this palette entry is a plain full cube (modelType 1).
+// Full cubes are the only blocks the octree DDA culls by identity, mirroring
+// CPU Octree.java:562 — its isSameMaterial test lives in the non-localIntersect
+// branch, so model blocks (panes, fences, slabs) are still intersected when the
+// same block repeats and must NOT be treated as a medium.
+bool BlockPalette_isFullCube(BlockPalette self, int block) {
+    return block != 0 && self.blockPalette[block] == 1;
+}
+
+// Material to take an emitter's light from when an emitter-NEE shadow ray reaches the
+// emitter's cell without hitting its geometry. Cubes, light blocks and water store
+// their material pointer directly; AABB and quad models (torches, lanterns, candles)
+// store a MODEL pointer, which is not a material index, so their first primitive's
+// material is used. -1 when the block has none.
+int BlockPalette_emitterMaterial(BlockPalette self, int block) {
+    int modelType = self.blockPalette[block];
+    int pointer = self.blockPalette[block + 1];
+    switch (modelType) {
+        case 1: case 4: case 5: return pointer;
+        case 2: return self.aabbModels[pointer] > 0 ? self.aabbModels[pointer + 1 + 7] : -1;
+        case 3: return self.quadModels[pointer] > 0 ? self.quadModels[pointer + 1 + 13] : -1;
+        default: return -1;
+    }
+}
+
 // Water height levels matching CPU Water.java height[] array.
 // Index 0 = level 0 (fullest), index 7 = level 7 (lowest).
 constant float WATER_HEIGHT[8] = {
@@ -77,12 +102,78 @@ bool Water_triangleIntersect(float3 v0, float3 v1, float3 v2, Ray ray,
     return true;
 }
 
-bool BlockPalette_intersectNormalizedBlock(BlockPalette self, image2d_array_t atlas, MaterialPalette materialPalette, int block, int3 blockPosition, Ray ray, IntersectionRecord* record, MaterialSample* sample) {
+// Water block surface mesh, in the exact order WaterModel's triangles were
+// tested before (ties between equally distant triangles resolve to the earlier
+// one, so the order is part of the result). Each triangle packs three 3-bit
+// vertex codes: bit 0 = x, bit 1 = z, bit 2 = "on the surface" (y = corner
+// height; otherwise y = 0). The corner heights are SW(x0,z1)=h0, SE(x1,z1)=h1,
+// NE(x1,z0)=h2, NW(x0,z0)=h3. The first two are the top surface.
+#define WATER_TRI(a, b, c) ((a) | ((b) << 3) | ((c) << 6))
+constant ushort WATER_TRIS[10] = {
+    WATER_TRI(6, 7, 5),  // top t012: (0,h0,1) (1,h1,1) (1,h2,0)
+    WATER_TRI(4, 6, 5),  // top t230: (0,h3,0) (0,h0,1) (1,h2,0)
+    WATER_TRI(4, 0, 6),  // west  t
+    WATER_TRI(2, 6, 0),  // west  b
+    WATER_TRI(5, 7, 1),  // east  t
+    WATER_TRI(7, 3, 1),  // east  b
+    WATER_TRI(6, 2, 7),  // south t
+    WATER_TRI(3, 7, 2),  // south b
+    WATER_TRI(4, 5, 0),  // north t
+    WATER_TRI(1, 0, 5),  // north b
+};
+#define WATER_TOP_TRIS 2
+#define WATER_ALL_TRIS 10
+
+float3 Water_vertex(uint code, float h0, float h1, float h2, float h3) {
+    bool x = code & 1;
+    bool z = (code >> 1) & 1;
+    float h = z ? (x ? h1 : h0) : (x ? h2 : h3);
+    return (float3)(x ? 1.0f : 0.0f, ((code >> 2) & 1) ? h : 0.0f, z ? 1.0f : 0.0f);
+}
+
+// Intersects triangles [first, last) of the water mesh in block-local space,
+// keeping the closest hit in *record with its normal facing the ray. The loop
+// is deliberately NOT unrolled: this runs inside every inlined trace.
+bool Water_intersectMesh(int first, int last, float h0, float h1, float h2, float h3,
+                         Ray ray, IntersectionRecord* record) {
+    bool hit = false;
+    __attribute__((opencl_unroll_hint(1)))
+    for (int i = first; i < last; i++) {
+        uint tri = WATER_TRIS[i];
+        float3 v0 = Water_vertex(tri & 7, h0, h1, h2, h3);
+        float3 v1 = Water_vertex((tri >> 3) & 7, h0, h1, h2, h3);
+        float3 v2 = Water_vertex((tri >> 6) & 7, h0, h1, h2, h3);
+        if (Water_triangleIntersect(v0, v1, v2, ray, record)) {
+            if (dot(record->normal, ray.direction) > 0)
+                record->normal = -record->normal;
+            hit = true;
+        }
+    }
+    return hit;
+}
+
+// Corner heights of a surface water block.
+void Water_cornerHeights(int waterData, float* h0, float* h1, float* h2, float* h3) {
+    *h0 = WATER_HEIGHT[((waterData >> WATER_CORNER_SW) & 0xF) % 8];  // SW: x=0, z=1
+    *h1 = WATER_HEIGHT[((waterData >> WATER_CORNER_SE) & 0xF) % 8];  // SE: x=1, z=1
+    *h2 = WATER_HEIGHT[((waterData >> WATER_CORNER_NE) & 0xF) % 8];  // NE: x=1, z=0
+    *h3 = WATER_HEIGHT[((waterData >> WATER_CORNER_NW) & 0xF) % 8];  // NW: x=0, z=0
+}
+
+// Flips a full-cube face UV into block texture orientation.
+float2 BlockPalette_cubeUv(IntersectionRecord r) {
+    float2 uv = r.texCoord;
+    if (r.normal.x > 0 || r.normal.z < 0) uv.x = 1 - uv.x;
+    if (r.normal.y > 0) uv.y = 1 - uv.y;
+    return uv;
+}
+
+bool BlockPalette_intersectNormalizedBlock(BlockPalette self, image2d_array_t atlas, MaterialPalette materialPalette, int block, int3 blockPosition, Ray ray, IntersectionRecord* record) {
     // ANY_TYPE. Should not be intersected.
     if (block == 0x7FFFFFFE) {
         return false;
     }
-    
+
     int modelType = self.blockPalette[block + 0];
     int modelPointer = self.blockPalette[block + 1];
 
@@ -100,32 +191,21 @@ bool BlockPalette_intersectNormalizedBlock(BlockPalette self, image2d_array_t at
         case 1: {
             // Full size block (non-water)
             AABB box = AABB_new(0, 1, 0, 1, 0, 1);
-            hit = AABB_full_intersect(box, tempRay, &tempRecord);
+            if (!AABB_full_intersect(box, tempRay, &tempRecord)) return false;
+            tempRecord.texCoord = BlockPalette_cubeUv(tempRecord);
+            if (!Material_alphaTest(Material_get(materialPalette, modelPointer), atlas, tempRecord.texCoord))
+                return false;
             tempRecord.material = modelPointer;
-            if (hit) {
-                if (tempRecord.normal.x > 0 || tempRecord.normal.z < 0) {
-                    tempRecord.texCoord.x = 1 - tempRecord.texCoord.x;
-                }
-                if (tempRecord.normal.y > 0) {
-                    tempRecord.texCoord.y = 1 - tempRecord.texCoord.y;
-                }
-                Material material = Material_get(materialPalette, modelPointer);
-                hit = Material_sample(material, atlas, tempRecord.texCoord, sample);
-                if (hit) {
-                    *record = tempRecord;
-                    return true;
-                } else {
-                    return false;
-                }
-            }
-            return false;
+            tempRecord.hitKind = HIT_MATERIAL;
+            *record = tempRecord;
+            return true;
         }
         case 2: {
             int boxes = self.aabbModels[modelPointer];
             for (int i = 0; i < boxes; i++) {
                 int offset = modelPointer + 1 + i * TEX_AABB_SIZE;
                 TexturedAABB box = TexturedAABB_new(self.aabbModels, offset);
-                hit |= TexturedAABB_intersect(box, atlas, materialPalette, tempRay, record, sample);
+                hit |= TexturedAABB_intersect(box, atlas, materialPalette, tempRay, record);
             }
             return hit;
         }
@@ -134,108 +214,70 @@ bool BlockPalette_intersectNormalizedBlock(BlockPalette self, image2d_array_t at
             for (int i = 0; i < quads; i++) {
                 int offset = modelPointer + 1 + i * QUAD_SIZE;
                 Quad q = Quad_new(self.quadModels, offset);
-                hit |= Quad_intersect(q, atlas, materialPalette, tempRay, record, sample);
+                hit |= Quad_intersect(q, atlas, materialPalette, tempRay, record);
             }
             return hit;
         }
         case 4: {
-            // Light block — invisible emitter that should:
-            //   1. Be invisible in main render (no geometry visible)
-            //   2. Emit light proportional to its level (1-15)
-            //   3. Light up surrounding surfaces via emitter NEE
-            //
-            // Behaviour by ray kind (path-trace mode):
-            //   Camera/indirect ray: AABB intersect succeeds, alpha forced
-            //     to 0 so Material_samplePdf picks doTransmit (pDiffuse=0).
-            //     The block is transparent but self-emission still fires
-            //     at the hit because emittance uses sample.color.xyz
-            //     ignoring alpha. → camera sees a glow at the block's
-            //     position, scene behind is visible through it.
-            //   Shadow ray (sun/emitter NEE): SKIP entirely (return false).
-            //     Without this skip, emitter NEE shadow rays cast at the
-            //     light block's outer-cube face would hit the inset
-            //     0.125-0.875 cube first and the distance check
-            //     (srec.distance >= dist - 1e-4f) would fail, dropping
-            //     the contribution. The "Emitter invisible to rays"
-            //     branch in rayTracer.c relies on shadowClear=true to
-            //     fire the look-up-from-octree path that actually
-            //     samples the light block's emittance for NEE.
-            //
-            // Preview mode: alpha stays at 1 so the block renders with
-            //   the chunky placeholder texture (so the user can see and
-            //   place them while editing).
-            if ((ray.flags & RAY_SHADOW) && !(ray.flags & RAY_PREVIEW)) {
+            // Light block (minecraft:light) — mirrors CPU LightBlock.intersect():
+            //   Preview ray: inset cube textured with Texture.light (opaque
+            //     white where the texture is transparent) so the block can be
+            //     seen and placed while editing.
+            //   Shadow ray (sun/emitter NEE): SKIP entirely (return false), so
+            //     emitter-NEE shadow rays reach the emitter face instead of the
+            //     inset cube; rayTracer.c's "emitter invisible to rays" branch
+            //     then samples the light block's emittance for NEE.
+            //   Path-trace ray: invisible to camera/specular rays and to all
+            //     rays when emitters are off or the block doesn't emit. Diffuse
+            //     indirect rays hit the inset cube as an OPAQUE flat-white
+            //     surface, so the self-emission block in rayTracer.c adds
+            //     emittance * emitterIntensity.
+            if (ray.flags & RAY_SHADOW) {
+                return false;
+            }
+            bool lightPreview = (ray.flags & RAY_PREVIEW) != 0;
+            if (!lightPreview
+                && !((ray.flags & RAY_EMITTERS) && (ray.flags & RAY_INDIRECT))) {
                 return false;
             }
             AABB box = AABB_new(0.125f, 0.875f, 0.125f, 0.875f, 0.125f, 0.875f);
-            hit = AABB_full_intersect(box, tempRay, &tempRecord);
-            tempRecord.material = modelPointer;
-            if (hit) {
-                if (tempRecord.normal.x > 0 || tempRecord.normal.z < 0) {
-                    tempRecord.texCoord.x = 1 - tempRecord.texCoord.x;
-                }
-                if (tempRecord.normal.y > 0) {
-                    tempRecord.texCoord.y = 1 - tempRecord.texCoord.y;
-                }
-                Material material = Material_get(materialPalette, tempRecord.material);
-                hit = Material_sample(material, atlas, tempRecord.texCoord, sample);
-                if (hit) {
-                    if (!(ray.flags & RAY_PREVIEW)) {
-                        sample->color.w = 0.0f;
-                    }
-                    *record = tempRecord;
-                    return true;
-                }
+            if (!AABB_full_intersect(box, tempRay, &tempRecord)) {
+                return false;
             }
-            return false;
+            tempRecord.texCoord = BlockPalette_cubeUv(tempRecord);
+            tempRecord.material = modelPointer;
+            Material material = Material_get(materialPalette, modelPointer);
+            if (!Material_alphaTest(material, atlas, tempRecord.texCoord)) {
+                return false;
+            }
+            // CPU LightBlock: no emission (level 0, or user zeroed it) means not
+            // intersectable at all; otherwise a flat opaque white surface (the
+            // glow comes from emittance in the path tracer, not the texture).
+            if (!lightPreview && Material_emittanceAt(material, atlas, tempRecord.texCoord) <= EPS) {
+                return false;
+            }
+            tempRecord.hitKind = lightPreview ? HIT_MATERIAL : HIT_LIGHT_WHITE;
+            *record = tempRecord;
+            return true;
         }
         case 5: {
             // Water block with per-corner height data.
             // Word 2 contains water data: bits 0-3=SW, 4-7=SE, 8-11=NE, 12-15=NW, bit 16=full.
             int waterData = self.blockPalette[block + 2];
             bool isFull = (waterData >> WATER_FULL_BLOCK) & 1;
-            Material material = Material_get(materialPalette, modelPointer);
 
             if (isFull) {
                 // Submerged water: full cube (block above is also water)
                 AABB box = AABB_new(0, 1, 0, 1, 0, 1);
-                hit = AABB_full_intersect(box, tempRay, &tempRecord);
-                tempRecord.material = modelPointer;
-                if (hit) {
-                    if (tempRecord.normal.x > 0 || tempRecord.normal.z < 0) {
-                        tempRecord.texCoord.x = 1 - tempRecord.texCoord.x;
-                    }
-                    if (tempRecord.normal.y > 0) {
-                        tempRecord.texCoord.y = 1 - tempRecord.texCoord.y;
-                    }
-                    hit = Material_sample(material, atlas, tempRecord.texCoord, sample);
-                    if (hit) {
-                        *record = tempRecord;
-                        return true;
-                    }
-                }
-                return false;
-            }
+                if (!AABB_full_intersect(box, tempRay, &tempRecord)) return false;
+                tempRecord.texCoord = BlockPalette_cubeUv(tempRecord);
+            } else {
+                // Surface water block: bottom face plus the triangulated top and
+                // sides with per-corner heights.
+                float h0, h1, h2, h3;
+                Water_cornerHeights(waterData, &h0, &h1, &h2, &h3);
 
-            // Surface water block: triangulated top surface with per-corner heights.
-            // Extract corner height indices (4 bits each, mod 8).
-            int c0 = ((waterData >> WATER_CORNER_SW) & 0xF) % 8;  // SW corner
-            int c1 = ((waterData >> WATER_CORNER_SE) & 0xF) % 8;  // SE corner
-            int c2 = ((waterData >> WATER_CORNER_NE) & 0xF) % 8;  // NE corner
-            int c3 = ((waterData >> WATER_CORNER_NW) & 0xF) % 8;  // NW corner
-
-            float h0 = WATER_HEIGHT[c0];  // SW: x=0, z=1
-            float h1 = WATER_HEIGHT[c1];  // SE: x=1, z=1
-            float h2 = WATER_HEIGHT[c2];  // NE: x=1, z=0
-            float h3 = WATER_HEIGHT[c3];  // NW: x=0, z=0
-
-            tempRecord.material = modelPointer;
-            IntersectionRecord triRecord;
-
-            // Bottom face
-            // Quad: (0,0,0) (1,0,0) (0,0,1) — always at y=0
-            {
-                AABB bottom = AABB_new(0, 1, 0, 0, 0, 1);
+                // Bottom face: (0,0,0) (1,0,0) (0,0,1) — always at y=0
                 float3 o = tempRay.origin;
                 if (fabs(tempRay.direction.y) > 1e-7f) {
                     float t = (0.0f - o.y) / tempRay.direction.y;
@@ -249,170 +291,15 @@ bool BlockPalette_intersectNormalizedBlock(BlockPalette self, image2d_array_t at
                         }
                     }
                 }
+                hit |= Water_intersectMesh(0, WATER_ALL_TRIS, h0, h1, h2, h3, tempRay, &tempRecord);
+                if (!hit) return false;
             }
-
-            // Top surface triangle 1: t012 — vertices at (0,h0,1), (1,h1,1), (1,h2,0)
-            // This is the SE triangle of the water surface.
-            {
-                float3 v0 = (float3)(0, h0, 1);
-                float3 v1 = (float3)(1, h1, 1);
-                float3 v2 = (float3)(1, h2, 0);
-                triRecord = tempRecord;
-                if (Water_triangleIntersect(v0, v1, v2, tempRay, &triRecord)) {
-                    // Orient normal to face the ray
-                    if (dot(triRecord.normal, tempRay.direction) > 0)
-                        triRecord.normal = -triRecord.normal;
-                    triRecord.material = modelPointer;
-                    tempRecord = triRecord;
-                    hit = true;
-                }
-            }
-
-            // Top surface triangle 2: t230 — vertices at (0,h3,0), (0,h0,1), (1,h2,0)
-            // This is the NW triangle of the water surface.
-            {
-                float3 v0 = (float3)(0, h3, 0);
-                float3 v1 = (float3)(0, h0, 1);
-                float3 v2 = (float3)(1, h2, 0);
-                triRecord = tempRecord;
-                if (Water_triangleIntersect(v0, v1, v2, tempRay, &triRecord)) {
-                    if (dot(triRecord.normal, tempRay.direction) > 0)
-                        triRecord.normal = -triRecord.normal;
-                    triRecord.material = modelPointer;
-                    tempRecord = triRecord;
-                    hit = true;
-                }
-            }
-
-            // West side (x=0): two triangles connecting top edge to bottom
-            // westt: (0,h3,0), (0,0,0), (0,h0,1)
-            {
-                float3 v0 = (float3)(0, h3, 0);
-                float3 v1 = (float3)(0, 0, 0);
-                float3 v2 = (float3)(0, h0, 1);
-                triRecord = tempRecord;
-                if (Water_triangleIntersect(v0, v1, v2, tempRay, &triRecord)) {
-                    if (dot(triRecord.normal, tempRay.direction) > 0)
-                        triRecord.normal = -triRecord.normal;
-                    triRecord.material = modelPointer;
-                    tempRecord = triRecord;
-                    hit = true;
-                }
-            }
-            // westb: (0,0,1), (0,h0,1), (0,0,0)
-            {
-                float3 v0 = (float3)(0, 0, 1);
-                float3 v1 = (float3)(0, h0, 1);
-                float3 v2 = (float3)(0, 0, 0);
-                triRecord = tempRecord;
-                if (Water_triangleIntersect(v0, v1, v2, tempRay, &triRecord)) {
-                    if (dot(triRecord.normal, tempRay.direction) > 0)
-                        triRecord.normal = -triRecord.normal;
-                    triRecord.material = modelPointer;
-                    tempRecord = triRecord;
-                    hit = true;
-                }
-            }
-
-            // East side (x=1): two triangles
-            // eastt: (1,h2,0), (1,h1,1), (1,0,0)
-            {
-                float3 v0 = (float3)(1, h2, 0);
-                float3 v1 = (float3)(1, h1, 1);
-                float3 v2 = (float3)(1, 0, 0);
-                triRecord = tempRecord;
-                if (Water_triangleIntersect(v0, v1, v2, tempRay, &triRecord)) {
-                    if (dot(triRecord.normal, tempRay.direction) > 0)
-                        triRecord.normal = -triRecord.normal;
-                    triRecord.material = modelPointer;
-                    tempRecord = triRecord;
-                    hit = true;
-                }
-            }
-            // eastb: (1,h1,1), (1,0,1), (1,0,0)
-            {
-                float3 v0 = (float3)(1, h1, 1);
-                float3 v1 = (float3)(1, 0, 1);
-                float3 v2 = (float3)(1, 0, 0);
-                triRecord = tempRecord;
-                if (Water_triangleIntersect(v0, v1, v2, tempRay, &triRecord)) {
-                    if (dot(triRecord.normal, tempRay.direction) > 0)
-                        triRecord.normal = -triRecord.normal;
-                    triRecord.material = modelPointer;
-                    tempRecord = triRecord;
-                    hit = true;
-                }
-            }
-
-            // South side (z=1): two triangles
-            // southt: (0,h0,1), (0,0,1), (1,h1,1)
-            {
-                float3 v0 = (float3)(0, h0, 1);
-                float3 v1 = (float3)(0, 0, 1);
-                float3 v2 = (float3)(1, h1, 1);
-                triRecord = tempRecord;
-                if (Water_triangleIntersect(v0, v1, v2, tempRay, &triRecord)) {
-                    if (dot(triRecord.normal, tempRay.direction) > 0)
-                        triRecord.normal = -triRecord.normal;
-                    triRecord.material = modelPointer;
-                    tempRecord = triRecord;
-                    hit = true;
-                }
-            }
-            // southb: (1,0,1), (1,h1,1), (0,0,1)
-            {
-                float3 v0 = (float3)(1, 0, 1);
-                float3 v1 = (float3)(1, h1, 1);
-                float3 v2 = (float3)(0, 0, 1);
-                triRecord = tempRecord;
-                if (Water_triangleIntersect(v0, v1, v2, tempRay, &triRecord)) {
-                    if (dot(triRecord.normal, tempRay.direction) > 0)
-                        triRecord.normal = -triRecord.normal;
-                    triRecord.material = modelPointer;
-                    tempRecord = triRecord;
-                    hit = true;
-                }
-            }
-
-            // North side (z=0): two triangles
-            // northt: (0,h3,0), (1,h2,0), (0,0,0)
-            {
-                float3 v0 = (float3)(0, h3, 0);
-                float3 v1 = (float3)(1, h2, 0);
-                float3 v2 = (float3)(0, 0, 0);
-                triRecord = tempRecord;
-                if (Water_triangleIntersect(v0, v1, v2, tempRay, &triRecord)) {
-                    if (dot(triRecord.normal, tempRay.direction) > 0)
-                        triRecord.normal = -triRecord.normal;
-                    triRecord.material = modelPointer;
-                    tempRecord = triRecord;
-                    hit = true;
-                }
-            }
-            // northb: (1,0,0), (0,0,0), (1,h2,0)
-            {
-                float3 v0 = (float3)(1, 0, 0);
-                float3 v1 = (float3)(0, 0, 0);
-                float3 v2 = (float3)(1, h2, 0);
-                triRecord = tempRecord;
-                if (Water_triangleIntersect(v0, v1, v2, tempRay, &triRecord)) {
-                    if (dot(triRecord.normal, tempRay.direction) > 0)
-                        triRecord.normal = -triRecord.normal;
-                    triRecord.material = modelPointer;
-                    tempRecord = triRecord;
-                    hit = true;
-                }
-            }
-
-            // If any triangle hit, sample the material
-            if (hit) {
-                hit = Material_sample(material, atlas, tempRecord.texCoord, sample);
-                if (hit) {
-                    *record = tempRecord;
-                    return true;
-                }
-            }
-            return false;
+            if (!Material_alphaTest(Material_get(materialPalette, modelPointer), atlas, tempRecord.texCoord))
+                return false;
+            tempRecord.material = modelPointer;
+            tempRecord.hitKind = HIT_MATERIAL;
+            *record = tempRecord;
+            return true;
         }
     }
 }

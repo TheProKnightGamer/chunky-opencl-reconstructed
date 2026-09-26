@@ -40,8 +40,12 @@ public class AnimatedTextureExporter implements TextureExporter {
         // Frame height is the same as width for square frames (Minecraft convention)
         this.frameHeight = Math.min(texture.getHeight(), texture.getWidth());
         int numFrames = Math.max(1, texture.getHeight() / Math.max(1, this.frameHeight));
-        int rawFrame = (int) (animationTime * DEFAULT_FRAMERATE);
-        this.frameIndex = Math.floorMod(rawFrame, numFrames);
+        this.frameIndex = Math.floorMod(frameAt(animationTime), numFrames);
+    }
+
+    /** The unwrapped frame number shown at {@code animationTime}. */
+    static int frameAt(double animationTime) {
+        return (int) (animationTime * DEFAULT_FRAMERATE);
     }
 
     @Override

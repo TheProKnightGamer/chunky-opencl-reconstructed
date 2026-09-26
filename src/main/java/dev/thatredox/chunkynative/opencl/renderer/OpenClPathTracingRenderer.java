@@ -3,12 +3,14 @@ package dev.thatredox.chunkynative.opencl.renderer;
 import static org.jocl.CL.*;
 
 import dev.thatredox.chunkynative.opencl.context.ContextManager;
+import dev.thatredox.chunkynative.opencl.context.Device;
 import dev.thatredox.chunkynative.opencl.renderer.scene.*;
 import dev.thatredox.chunkynative.opencl.util.ClIntBuffer;
 import dev.thatredox.chunkynative.opencl.util.ClMemory;
 import org.jocl.*;
 import se.llbit.chunky.renderer.*;
 import se.llbit.chunky.renderer.scene.Scene;
+import se.llbit.log.Log;
 import se.llbit.util.TaskTracker;
 
 import java.nio.ByteBuffer;
@@ -72,9 +74,198 @@ public class OpenClPathTracingRenderer implements Renderer {
     private ClMemory cachedAccumulator = null;       // pixelCount * 3 doubles
     private ClMemory cachedAccPassBuffer = null;     // pixelCount * 4 floats (single, not pinned)
 
-    // Cached calibration result — only recalibrate when pixel count changes
+    // --- Launch-size control -------------------------------------------------
+    // Every kernel launch must stay FAR below the OS GPU watchdog (~2 s on
+    // Windows TDR, and on Linux for a display-attached GPU). When a launch
+    // exceeds it the driver resets the device and every subsequent CL call
+    // fails with CL_OUT_OF_RESOURCES / CL_INVALID_COMMAND_QUEUE.
+    //
+    // Two knobs bound the work in one launch, applied in a strict order so they
+    // cannot fight each other:
+    //   sliceCount — SAFETY knob. A frame is split into S dispatches. Slice s
+    //     owns the G-sized pixel blocks q where q % S == s (G = the global work
+    //     size), so the slices INTERLEAVE across the frame rather than cutting it
+    //     into contiguous horizontal bands. That matters: a band of sky costs a
+    //     fraction of a band of dense terrain, so with contiguous bands the
+    //     per-launch budget below — which is an average — would hide a heavy band
+    //     that alone trips the watchdog. Interleaved slices are cost-uniform, so
+    //     the average IS the worst case. Slicing is bit-exact (the kernel keys the
+    //     RNG seed, camera ray and output slot off the GLOBAL pixel index) and
+    //     costs only a few extra launches per frame (~10-50 us each). This is what
+    //     rescues a 4K frame too heavy to render in one launch — the case ipl
+    //     alone cannot fix, because ipl bottoms out at 1, which is still a whole
+    //     frame.
+    //   iterationsPerLaunch (ipl) — THROUGHPUT knob. Batches several full-frame
+    //     passes into one launch to amortise launch overhead. Only grown once a
+    //     whole frame already fits comfortably in a single launch.
+    //
+    // Both are driven ONLY by measured launch times, never by extrapolation. The
+    // old 32k-pixel calibration extrapolated from the frame's first pixel
+    // indices — the TOP ROWS, which are mostly sky and far cheaper than a real
+    // pixel — and that underestimate is what tripped the watchdog.
     private int cachedIpl = 1;
+    private int cachedSliceCount = -1;
     private int calibratedForPixels = -1;
+    private int lastSceneGeneration = Integer.MIN_VALUE;
+
+    private static final double TARGET_LAUNCH_MS = 500.0;
+    private static final double LAUNCH_HARD_CEIL_MS = 1100.0;
+    private static final int MAX_IPL = 100;
+    private static final int MAX_SLICES = 4096;
+    private static final long PERSISTENT_THREAD_CAP = 262144L;
+    /**
+     * Work-items per compute unit on NVIDIA: two waves of the render kernel at its
+     * 128-register cap (2 x 256-item work-groups per SM). Launching more than that
+     * only queues work-groups behind each other; on an RTX 3070 two waves ran 4-6%
+     * faster than the {@link #PERSISTENT_THREAD_CAP} default.
+     */
+    private static final long NV_THREADS_PER_COMPUTE_UNIT = 1024L;
+    /** Upper bound on the work-items in one dispatch; see {@link #threadCapFor}. */
+    private long persistentThreadCap = PERSISTENT_THREAD_CAP;
+    /**
+     * Work-group granularity. The global work size is always a multiple of this.
+     * <p>Required for correctness of a sort: {@code local_work_size} is passed as
+     * null, so the driver must choose a local size that evenly DIVIDES the global
+     * size. An awkward global size (odd, or prime) forces some drivers all the way
+     * down to local_work_size = 1, which would run the kernel's cooperative
+     * matCache copy as up to 8192 serial global loads per work-item and collapse
+     * occupancy — a 100x+ slowdown that could itself trip the watchdog this whole
+     * mechanism exists to avoid.
+     */
+    private static final long WORKGROUP_GRANULARITY = 256L;
+    /**
+     * How many G-sized pixel blocks each slice should get, so that a slice samples
+     * enough of the frame for its cost to be representative. Only a lower bound on
+     * sampling quality — coverage is exact for any value.
+     */
+    private static final int BLOCKS_PER_SLICE = 16;
+    /**
+     * The warm-up renders {@link #WARMUP_BLOCKS} blocks of {@link #WARMUP_BLOCK_PIXELS}
+     * pixels each, spread evenly across the WHOLE frame (top to bottom) rather than a
+     * contiguous prefix.
+     *
+     * <p>This is the root-cause fix for the original watchdog bug. The old warm-up
+     * measured pixels [0, 32768) — the frame's TOP ROWS, which for a typical outdoor
+     * shot are almost pure sky. A sky ray misses everything and terminates instantly;
+     * a terrain ray does rayDepth bounces of octree DDA plus shadow rays, and can cost
+     * 100x+ more. Extrapolating a whole frame from that prefix underestimated it by
+     * one to two orders of magnitude, and the resulting first launch ran for seconds.
+     * No safety factor can paper over a sample that unrepresentative — so the sample
+     * is now representative instead, and only a modest margin is applied on top.
+     */
+    private static final int WARMUP_BLOCKS = 16;
+    private static final long WARMUP_BLOCK_PIXELS = 2048; // multiple of WORKGROUP_GRANULARITY
+    private static final double WARMUP_SAFETY = 2.0;
+
+    /**
+     * Work-items per dispatch. Chosen so each slice covers ~{@link #BLOCKS_PER_SLICE}
+     * interleaved blocks (enough of the frame to be cost-representative), capped at
+     * the device's {@link #threadCapFor persistent-thread cap}, and always a
+     * multiple of {@link #WORKGROUP_GRANULARITY}.
+     */
+    private long globalSizeFor(int pixelCount, int sliceCount) {
+        long ideal = Math.max(1L,
+                (long) pixelCount / Math.max(1L, (long) sliceCount * BLOCKS_PER_SLICE));
+        long g = Math.min(ideal, persistentThreadCap);
+        g = ((g + WORKGROUP_GRANULARITY - 1) / WORKGROUP_GRANULARITY) * WORKGROUP_GRANULARITY;
+        return Math.max(WORKGROUP_GRANULARITY, Math.min(g, persistentThreadCap));
+    }
+
+    /** The persistent-thread cap for a device: two resident waves on NVIDIA. */
+    private static long threadCapFor(Device device) {
+        if (!device.supportsNvCompilerOptions()) return PERSISTENT_THREAD_CAP;
+        long units = device.getInts(CL_DEVICE_MAX_COMPUTE_UNITS, 1)[0];
+        long cap = units * NV_THREADS_PER_COMPUTE_UNIT;
+        cap = (cap / WORKGROUP_GRANULARITY) * WORKGROUP_GRANULARITY;
+        return Math.max(WORKGROUP_GRANULARITY, Math.min(cap, PERSISTENT_THREAD_CAP));
+    }
+
+    /**
+     * Feedback controller for the launch-size knobs. Called once per pass with that
+     * pass's measured wall time AND the exact configuration that pass was dispatched
+     * with; updates {@link #cachedIpl} / {@link #cachedSliceCount} in place.
+     *
+     * <p>Every term is derived from the MEASURED configuration, never from the
+     * current one. This matters because on the CPU-blend path the pass being timed
+     * is the previous one, whose ipl/slice size may already differ from the current
+     * values. Dividing an old pass's cost by the new (larger) batch size would
+     * understate the per-unit cost and grow the batch again on the strength of a
+     * measurement that never justified it — a self-sustaining doubling ramp that
+     * walks straight into the watchdog. Keying off the measured config makes the
+     * lag merely slow convergence instead of breaking it.
+     *
+     * <p>Growth is capped at x2 per step, since the measurement justifying it was
+     * taken at the smaller size and cost is not perfectly linear in launch size
+     * (cache effects, divergence). Between TARGET and HARD_CEIL nothing changes,
+     * giving the controller a hysteresis band so it settles instead of oscillating.
+     */
+    private void adaptLaunchSize(double passMs, int measuredIpl, int measuredSliceCount,
+                                 int pixelCount) {
+        // Slices are interleaved and therefore cost-uniform, so the mean launch
+        // time is also the worst-case launch time — which is what the watchdog
+        // actually cares about. (With contiguous slices this average would be a
+        // lie: a heavy terrain band could be several times the mean.)
+        double perLaunchMs = passMs / Math.max(1, measuredSliceCount);
+
+        if (perLaunchMs > LAUNCH_HARD_CEIL_MS) {
+            // Too close to the watchdog. Shed iterations first (pure throughput);
+            // only once a launch is a single pass do we cut the frame into more
+            // slices, which is what actually rescues a frame too heavy for one
+            // launch.
+            if (measuredIpl > 1) {
+                cachedIpl = Math.max(1, measuredIpl / 2);
+            } else {
+                cachedSliceCount = Math.min(MAX_SLICES, Math.max(2, measuredSliceCount * 2));
+            }
+            return;
+        }
+
+        if (perLaunchMs >= TARGET_LAUNCH_MS) {
+            return; // inside the hysteresis band — leave both knobs alone
+        }
+
+        double headroom = TARGET_LAUNCH_MS / Math.max(perLaunchMs, 0.01);
+        if (measuredSliceCount > 1) {
+            // Coalesce slices back toward a whole frame before touching ipl.
+            int shrunk = (int) Math.ceil(measuredSliceCount / Math.min(headroom, 2.0));
+            cachedSliceCount = Math.max(1, Math.min(measuredSliceCount, shrunk));
+        } else {
+            // A whole frame already fits in one launch; batch passes for throughput.
+            int ideal = Math.max(1, Math.min(MAX_IPL, (int) (measuredIpl * headroom)));
+            cachedIpl = ideal > measuredIpl ? Math.min(measuredIpl * 2, ideal) : ideal;
+        }
+    }
+
+    /**
+     * Enqueues one full frame as {@code sliceCount} interleaved dispatches, each
+     * small enough to stay under the GPU watchdog. Slice s walks the pixels
+     * {@code s*G, s*G+1, … } stepping by {@code sliceCount*G}, so it owns the
+     * G-sized blocks q where {@code q % sliceCount == s}. Every pixel in
+     * [0, pixelCount) is therefore covered exactly once and the frame is
+     * bit-identical to what a single dispatch would have produced.
+     *
+     * @return the number of dispatches used
+     */
+    private int dispatchFrame(cl_command_queue queue, cl_kernel kernel,
+                              int pixelStartArgIndex, int pixelStrideArgIndex,
+                              int pixelCountArgIndex, int pixelCount, int sliceCount,
+                              long[] globalScratch) {
+        long g = globalSizeFor(pixelCount, sliceCount);
+        // s*g and sliceCount*g both stay well inside int range: g is derived from
+        // pixelCount/(sliceCount*BLOCKS_PER_SLICE), so sliceCount*g <= pixelCount.
+        int stride = (int) (sliceCount * g);
+        setIntKernelArg(kernel, pixelStrideArgIndex, stride);
+        setIntKernelArg(kernel, pixelCountArgIndex, pixelCount);
+        globalScratch[0] = g;
+        for (int s = 0; s < sliceCount; s++) {
+            setIntKernelArg(kernel, pixelStartArgIndex, (int) (s * g));
+            // OpenCL snapshots kernel arguments at enqueue time, so rewriting
+            // pixelStart between back-to-back enqueues is safe and each dispatch
+            // keeps its own range.
+            clEnqueueNDRangeKernel(queue, kernel, 1, null, globalScratch, null, 0, null, null);
+        }
+        return sliceCount;
+    }
 
     // Reusable scratch for clSetKernelArg(int) calls. Avoids allocating a new
     // int[1] + Pointer per arg per render(). clSetKernelArg copies the value
@@ -139,6 +330,17 @@ public class OpenClPathTracingRenderer implements Renderer {
         int pixelCount = sampleBuffer.length / 3;
         sceneLoader.ensureLoad(manager.bufferedScene);
 
+        // A scene (re)load invalidates the launch-size tuning: a stale
+        // iterations-per-launch carried over from a lighter scene can push a
+        // single launch past the GPU watchdog on the heavier one.
+        int sceneGeneration = sceneLoader.getResetGeneration();
+        if (sceneGeneration != lastSceneGeneration) {
+            lastSceneGeneration = sceneGeneration;
+            cachedIpl = 1;
+            cachedSliceCount = -1;
+            calibratedForPixels = -1;
+        }
+
         // GPU fp64 accumulator path is enabled iff the device supports
         // cl_khr_fp64 AND its kernel compiled. ContextManager handles the
         // try/catch and leaves accumulator==null on failure. We pick the
@@ -152,6 +354,7 @@ public class OpenClPathTracingRenderer implements Renderer {
             if (cachedKernel != null) clReleaseKernel(cachedKernel);
             cachedKernel = clCreateKernel(context.renderer.kernel, "render", null);
             cachedCtx = context;
+            persistentThreadCap = threadCapFor(context.device);
             releaseAllCached();
         }
         if (useGpuAcc && cachedAccumulateKernel == null) {
@@ -285,7 +488,12 @@ public class OpenClPathTracingRenderer implements Renderer {
             // allocations and lets material-rich modded scenes (>2048 word
             // palettes) fully cache instead of falling through to global
             // for the tail.
-            int matCacheWords = Math.min(8192, sceneLoader.getMaterialPalette().wordCount());
+            // Off on NVIDIA: there the palette reads are L1 hits anyway, and the up to
+            // 32 KB of shared memory per work-group comes out of the same on-chip
+            // storage that holds the kernel's register spills (3% faster without it
+            // on an RTX 3070).
+            int matCacheWords = context.device.supportsNvCompilerOptions()
+                    ? 0 : Math.min(8192, sceneLoader.getMaterialPalette().wordCount());
             setIntKernelArg(kernel, argIndex++, matCacheWords);
             clSetKernelArg(kernel, argIndex++, Sizeof.cl_uint * Math.max(matCacheWords, 1), null);
             clSetKernelArg(kernel, argIndex++, Sizeof.cl_mem, Pointer.to(sceneLoader.getSky().skyTexture.get()));
@@ -322,9 +530,13 @@ public class OpenClPathTracingRenderer implements Renderer {
             // mapped to host); CPU-blend path uses ping-pong slot 0.
             ClMemory initialOutputBuffer = useGpuAcc ? cachedAccPassBuffer : cachedOutputBuffers[0];
             clSetKernelArg(kernel, argIndex++, Sizeof.cl_mem, Pointer.to(initialOutputBuffer.get()));
-            // Pixel-count arg consumed by the kernel's grid-stride outer loop.
-            // Captured here so calibration can temporarily override it to its
-            // smaller subset and the main loop can restore the full count.
+            // Pixel walk (start, stride, count) consumed by the kernel's outer
+            // loop. dispatchFrame() rewrites these per slice; the warm-up below
+            // overrides them for its small subset.
+            int pixelStartArgIndex = argIndex;
+            setIntKernelArg(kernel, argIndex++, 0);
+            int pixelStrideArgIndex = argIndex;
+            setIntKernelArg(kernel, argIndex++, (int) persistentThreadCap);
             int pixelCountArgIndex = argIndex;
             setIntKernelArg(kernel, argIndex++, pixelCount);
             int[] cfg = new int[5];
@@ -340,14 +552,13 @@ public class OpenClPathTracingRenderer implements Renderer {
             // When a pixel's path terminates fast the work-item picks up
             // the next pixel without waiting for its warp peers.
             //
-            // Cap chosen as 256k threads — empirically enough to fill
-            // modern GPUs (40-80 SMs × ~2-4k threads in flight) while
-            // small enough that each thread sees ~8 pixels at 1080p,
+            // Cap chosen as 256k threads (PERSISTENT_THREAD_CAP) — empirically
+            // enough to fill modern GPUs (40-80 SMs × ~2-4k threads in flight)
+            // while small enough that each thread sees ~8 pixels at 1080p,
             // giving the divergence-reduction benefit a chance to amortise.
-            // For tiny canvases (preview-sized renders <256k pixels) the
-            // launch falls back to one thread per pixel — same as before.
-            long persistentThreads = Math.min((long) pixelCount, 262144L);
-            final long[] dispatchGlobal = new long[]{persistentThreads};
+            // For a slice smaller than the cap the launch falls back to one
+            // thread per pixel. dispatchFrame() applies this per slice.
+            final long[] dispatchGlobal = new long[1];
             // The accumulate kernel is a 1:1 elementwise fp64 blend guarded by
             // `if (gid >= pixelCount) return` — it has NO grid-stride loop, so it
             // must be launched with at least one work-item per pixel. Reusing
@@ -386,39 +597,71 @@ public class OpenClPathTracingRenderer implements Renderer {
                     Sizeof.cl_float, emitterIntensityPtr, 0, null, null);
 
             if (calibratedForPixels != pixelCount) {
-                // Calibration size capped at 32 768 pixels regardless of
-                // canvas resolution. The previous heuristic ran 25% of the
-                // frame as a throwaway dispatch (518k pixels at 1080p,
-                // ~2M at 4K) which dwarfed the timing signal we needed.
-                // 32k pixels gives a stable timing measurement (a few ms
-                // on real GPUs, well above scheduler noise) while
-                // costing under 2% of a 1080p frame and under 0.5% of 4K.
-                int calSize = Math.min(pixelCount, 32768);
-                // Override pixelCount arg so the kernel's grid-stride loop
-                // bounds itself to the calibration subset. Otherwise each
-                // work-item would still chew through the whole frame and the
-                // timing would be useless (and the calibration would render
-                // a complete frame).
-                setIntKernelArg(kernel, pixelCountArgIndex, calSize);
+                // Warm-up: render a REPRESENTATIVE sample of the frame and use it to
+                // size the first pass. The kernel's (start, stride, count) walk makes
+                // this a one-liner: with pixelStart = 0, a global size of G and a
+                // stride of S, one dispatch renders G-pixel blocks at 0, S, 2S, …,
+                // i.e. WARMUP_BLOCKS blocks spread evenly from the top of the frame
+                // to the bottom. That samples sky AND terrain in roughly their true
+                // proportions, unlike the old contiguous [0, 32768) prefix (see
+                // WARMUP_BLOCKS).
+                //
+                // It also still materialises the lazily-allocated buffers on a cheap
+                // launch, so a scene that genuinely exhausts device memory fails here
+                // on a small, debuggable dispatch rather than mid-render.
+                long warmG;
+                int warmStride;
+                if (pixelCount <= WARMUP_BLOCKS * WARMUP_BLOCK_PIXELS) {
+                    // Frame is small enough to just render all of it: one work-item
+                    // per pixel (rounded up to a whole work-group; the surplus items
+                    // fall straight out of the kernel's loop), stride = the frame, so
+                    // the "sample" is the entire image and the extrapolation is exact.
+                    warmG = ((pixelCount + WORKGROUP_GRANULARITY - 1)
+                            / WORKGROUP_GRANULARITY) * WORKGROUP_GRANULARITY;
+                    warmStride = pixelCount;
+                } else {
+                    warmG = WARMUP_BLOCK_PIXELS;
+                    warmStride = pixelCount / WARMUP_BLOCKS; // > warmG, so blocks never overlap
+                }
+                // Pixels the dispatch actually renders, counted exactly so the
+                // extrapolation below is honest.
+                long sampled = 0;
+                for (long base = 0; base < pixelCount; base += warmStride) {
+                    sampled += Math.min(warmG, pixelCount - base);
+                }
+
+                setIntKernelArg(kernel, iterationsArgIndex, 1);
+                setIntKernelArg(kernel, pixelStartArgIndex, 0);
+                setIntKernelArg(kernel, pixelStrideArgIndex, warmStride);
+                setIntKernelArg(kernel, pixelCountArgIndex, pixelCount);
+                dispatchGlobal[0] = warmG;
                 long calStart = System.nanoTime();
                 clEnqueueNDRangeKernel(context.context.queue, kernel, 1,
-                        null, new long[]{calSize}, null, 0, null, null);
+                        null, dispatchGlobal, null, 0, null, null);
                 clFinish(context.context.queue);
                 double calMs = (System.nanoTime() - calStart) / 1e6;
-                double fullFrameMs = (calMs / calSize) * pixelCount;
 
+                // Extrapolate to a full frame from the representative sample, keep a
+                // modest safety margin, and pick enough slices to land near TARGET.
+                double frameMs = calMs * ((double) pixelCount / Math.max(1, sampled));
+                int seedSlices = (int) Math.max(1, Math.min(MAX_SLICES,
+                        Math.ceil(frameMs * WARMUP_SAFETY / TARGET_LAUNCH_MS)));
                 iterationsPerLaunch = 1;
-                if (fullFrameMs > 0 && fullFrameMs < 800.0) {
-                    iterationsPerLaunch = Math.max(1, Math.min(100, (int) (800.0 / fullFrameMs)));
-                }
-                cachedIpl = iterationsPerLaunch;
+                cachedIpl = 1;
+                cachedSliceCount = seedSlices;
                 calibratedForPixels = pixelCount;
                 setIntKernelArg(kernel, iterationsArgIndex, iterationsPerLaunch);
-                // Restore pixelCount arg so the main loop sees the full frame.
-                setIntKernelArg(kernel, pixelCountArgIndex, pixelCount);
-                System.err.printf("[ChunkyCL] Cal: %.1fms/%dpx, frame=%.0fms, ipl=%d%n",
-                        calMs, calSize, fullFrameMs, iterationsPerLaunch);
+                Log.info(String.format(
+                        "[ChunkyCL] warm-up: %.1f ms for %d sampled px -> est. frame %.0f ms; "
+                                + "first pass in %d slice(s), ipl=1",
+                        calMs, sampled, frameMs, seedSlices));
             }
+            // Clamp: a cached value from a previous render of this same scene +
+            // resolution is reused, but it must still be a legal slice count.
+            if (cachedSliceCount <= 0) {
+                cachedSliceCount = 1;
+            }
+            cachedSliceCount = Math.max(1, Math.min(cachedSliceCount, MAX_SLICES));
 
             // Double-buffered pipeline. Two output buffers + two host-side
             // staging arrays. Each iteration:
@@ -505,6 +748,7 @@ public class OpenClPathTracingRenderer implements Renderer {
                 final double[] weightScratch = new double[1];
 
                 while (scene.spp < scene.getTargetSpp()) {
+                    long launchStartNanos = System.nanoTime();
                     cfg[0] = rand.nextInt();
                     cfg[1] = 0;
                     cfg[2] = scene.getEmittersEnabled() ? 1 : 0;
@@ -519,11 +763,17 @@ public class OpenClPathTracingRenderer implements Renderer {
                         clEnqueueWriteBuffer(context.context.queue, emitterIntensityMem.get(), CL_TRUE, 0,
                                 Sizeof.cl_float, emitterIntensityPtr, 0, null, null);
                     }
-                    // Path-trace this pass into the single fp32 buffer.
-                    clEnqueueNDRangeKernel(context.context.queue, kernel, 1,
-                            null, dispatchGlobal, null, 0, null, null);
+                    // Path-trace this pass into the single fp32 buffer, split
+                    // across as many dispatches as the watchdog budget needs.
+                    // Snapshot the config actually used so the controller below
+                    // scores the measurement against the right configuration.
+                    int usedSliceCount = cachedSliceCount;
+                    int usedIpl = iterationsPerLaunch;
+                    dispatchFrame(context.context.queue, kernel,
+                            pixelStartArgIndex, pixelStrideArgIndex, pixelCountArgIndex,
+                            pixelCount, usedSliceCount, dispatchGlobal);
 
-                    int passSpp = iterationsPerLaunch * Math.max(1, scene.getCurrentBranchCount());
+                    int passSpp = usedIpl * Math.max(1, scene.getCurrentBranchCount());
                     // Weights computed in fp64 the same way as the CPU loop:
                     //   prevWeight = committedSpp / (committedSpp + passSpp)
                     //   passWeight = passSpp     / (committedSpp + passSpp)
@@ -538,6 +788,23 @@ public class OpenClPathTracingRenderer implements Renderer {
 
                     clEnqueueNDRangeKernel(context.context.queue, cachedAccumulateKernel, 1,
                             null, accumulateGlobal, null, 0, null, null);
+
+                    // Wait for this pass and time it for the launch-size
+                    // controller. The clFinish costs nothing extra here: the
+                    // next iteration's blocking config write would drain the
+                    // in-order queue anyway, and there is no per-iteration
+                    // host work to overlap with on this path. Timing the whole
+                    // pass (every slice) keeps the estimate representative of
+                    // the full frame rather than of one cheap region.
+                    clFinish(context.context.queue);
+                    double passMs = (System.nanoTime() - launchStartNanos) / 1e6;
+                    // clFinish above means passMs times exactly the pass just
+                    // dispatched, so the measured config IS the current one.
+                    adaptLaunchSize(passMs, usedIpl, usedSliceCount, pixelCount);
+                    if (cachedIpl != iterationsPerLaunch) {
+                        iterationsPerLaunch = cachedIpl;
+                        setIntKernelArg(kernel, iterationsArgIndex, iterationsPerLaunch);
+                    }
 
                     committedSpp = (int) Math.min((long) Integer.MAX_VALUE, total);
                     scene.spp = committedSpp;
@@ -579,9 +846,10 @@ public class OpenClPathTracingRenderer implements Renderer {
                     scene.postProcessFrame(TaskTracker.Task.NONE);
                     manager.redrawScreen();
                 }
-                if (scene.spp >= scene.getTargetSpp()) {
-                    scene.spp = scene.getTargetSpp() + 1;
-                }
+                // Do NOT inflate scene.spp past the target here. Chunky's
+                // DefaultRenderManager completes on `spp >= targetSpp` (it used
+                // to use `>`, which is why an overshoot hack lived here);
+                // inflating now just reports one more sample than was rendered.
                 postRender.getAsBoolean();
                 return;
             }
@@ -594,8 +862,14 @@ public class OpenClPathTracingRenderer implements Renderer {
             cl_event pendingRead = null;
             int pendingPassSpp = 0;
             int pendingIdx = -1;
+            // The launch config the in-flight pass was dispatched with. The timing
+            // below completes one pass behind the one just enqueued, so the
+            // controller must score it against THIS config, not the current one.
+            int pendingIpl = 0;
+            int pendingSliceCount = 0;
             try {
             while (scene.spp < scene.getTargetSpp()) {
+                long launchStartNanos = System.nanoTime();
                 cfg[0] = rand.nextInt();
                 cfg[1] = 0;
                 cfg[2] = scene.getEmittersEnabled() ? 1 : 0;
@@ -618,9 +892,12 @@ public class OpenClPathTracingRenderer implements Renderer {
                             Sizeof.cl_float, emitterIntensityPtr, 0, null, null);
                 }
                 clSetKernelArg(kernel, outputArgIndex, Sizeof.cl_mem, outputArgPtrs[curIdx]);
-                clEnqueueNDRangeKernel(context.context.queue, kernel, 1,
-                        null, dispatchGlobal, null, 0, null, null);
-                int passSpp = iterationsPerLaunch * Math.max(1, scene.getCurrentBranchCount());
+                int usedSliceCount = cachedSliceCount;
+                int usedIpl = iterationsPerLaunch;
+                dispatchFrame(context.context.queue, kernel,
+                        pixelStartArgIndex, pixelStrideArgIndex, pixelCountArgIndex,
+                        pixelCount, usedSliceCount, dispatchGlobal);
+                int passSpp = usedIpl * Math.max(1, scene.getCurrentBranchCount());
                 cl_event readEvent = new cl_event();
                 // Map the pinned output buffer for read. With pinned memory
                 // (CL_MEM_ALLOC_HOST_PTR) this is a pointer hand-back rather
@@ -657,9 +934,13 @@ public class OpenClPathTracingRenderer implements Renderer {
                 cl_event toProcess = pendingRead;
                 int toProcessIdx = pendingIdx;
                 int toProcessSpp = pendingPassSpp;
+                int toProcessIpl = pendingIpl;
+                int toProcessSlices = pendingSliceCount;
                 pendingRead = readEvent;
                 pendingPassSpp = passSpp;
                 pendingIdx = curIdx;
+                pendingIpl = usedIpl;
+                pendingSliceCount = usedSliceCount;
                 curIdx ^= 1;
 
                 if (toProcess != null) {
@@ -677,6 +958,24 @@ public class OpenClPathTracingRenderer implements Renderer {
                     cachedPassByteBuffers[toProcessIdx] = null;
                     cachedPassFloatBuffers[toProcessIdx] = null;
                     clReleaseEvent(toProcess);
+                    // The queue is in-order and the config write at the top of this
+                    // iteration is blocking, so by the time we get here the pass
+                    // being timed is the one ENQUEUED LAST ITERATION (toProcess),
+                    // not the one enqueued just above. Score the measurement against
+                    // THAT pass's config — using the current (possibly already
+                    // grown) config would understate its per-unit cost and grow the
+                    // batch again on a measurement that never justified it.
+                    //
+                    // The window also includes the CPU blend of the previous pass.
+                    // When the blend dominates this OVER-estimates GPU time, which
+                    // only biases the launch size DOWN — the safe direction for the
+                    // watchdog.
+                    double passMs = (System.nanoTime() - launchStartNanos) / 1e6;
+                    adaptLaunchSize(passMs, toProcessIpl, toProcessSlices, pixelCount);
+                    if (cachedIpl != iterationsPerLaunch) {
+                        iterationsPerLaunch = cachedIpl;
+                        setIntKernelArg(kernel, iterationsArgIndex, iterationsPerLaunch);
+                    }
                     committedSpp += toProcessSpp;
                     scene.spp = committedSpp;
                     sppSinceRedraw += toProcessSpp;
@@ -747,12 +1046,36 @@ public class OpenClPathTracingRenderer implements Renderer {
                 scene.postProcessFrame(TaskTracker.Task.NONE);
                 manager.redrawScreen();
             }
-            if (scene.spp >= scene.getTargetSpp()) {
-                scene.spp = scene.getTargetSpp() + 1;
-            }
+            // Do NOT inflate scene.spp past the target here. Chunky's
+            // DefaultRenderManager completes on `spp >= targetSpp` (it used
+            // to use `>`, which is why an overshoot hack lived here);
+            // inflating now just reports one more sample than was rendered.
             postRender.getAsBoolean();
+        } catch (CLException e) {
+            logClRenderFailure(e);
+            throw e;
         } finally {
             camera.close();
+        }
+    }
+
+    /**
+     * Attaches a human-readable explanation to the OpenCL error codes users
+     * actually hit, before the exception propagates to Chunky's render manager.
+     */
+    private static void logClRenderFailure(CLException e) {
+        int status = e.getStatus();
+        if (status == CL_OUT_OF_RESOURCES || status == CL_INVALID_COMMAND_QUEUE) {
+            Log.error("[ChunkyCL] Render failed with " + stringFor_errorCode(status)
+                    + ". On Windows this usually means the GPU watchdog (TDR, ~2 s) killed an"
+                    + " over-long kernel launch and reset the device — NOT that the GPU ran out"
+                    + " of memory. The launch batcher self-tunes upward from 1 pass per launch,"
+                    + " so if this persists even a single pass exceeds the watchdog: lower the"
+                    + " render resolution, or raise the TdrDelay registry value.");
+        } else if (status == CL_MEM_OBJECT_ALLOCATION_FAILURE || status == CL_OUT_OF_HOST_MEMORY) {
+            Log.error("[ChunkyCL] Render failed with " + stringFor_errorCode(status)
+                    + ": the scene plus render buffers exceed available device/host memory."
+                    + " Try fewer chunks or a lower render resolution.");
         }
     }
 

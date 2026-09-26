@@ -1,5 +1,6 @@
 package dev.thatredox.chunkynative.common.export;
 
+import dev.thatredox.chunkynative.common.emissive.EmissionResolver;
 import dev.thatredox.chunkynative.common.export.models.PackedAabbModel;
 import dev.thatredox.chunkynative.common.export.models.PackedBvhNode;
 import dev.thatredox.chunkynative.common.export.models.PackedQuadModel;
@@ -79,8 +80,26 @@ public abstract class AbstractSceneLoader {
         BVH worldBvh = Reflection.getFieldValue(entities, "bvh", BVH.class);
         BVH actorBvh = Reflection.getFieldValue(entities, "actorBvh", BVH.class);
 
+        // Hoisted so the octree-changed test below can gate BOTH the palette
+        // rebuild and the octree upload on the same values.
+        Octree.OctreeImplementation impl = scene.getWorldOctree().getImplementation();
+        Octree.OctreeImplementation waterImpl = scene.getWaterOctree().getImplementation();
+
+        // Loading chunks into an EXISTING scene ("Load selected chunks") builds a
+        // new octree AND grows the scene's block palette with the newly visible
+        // block types — but it does not always reach us as SCENE_LOADED. The
+        // octree upload below indexes blockMapping, which is only built when
+        // needTextureLoad is set, so without this term the upload ran with
+        // blockMapping == null (NPE: "Cannot read the array length because
+        // blockMapping is null"). Rebuilding the palettes is also REQUIRED for
+        // correctness, not just to dodge the NPE: a mapping built from the old
+        // palette would index the new octree's block IDs wrongly, and textures
+        // for the new blocks would be missing from the atlas.
+        boolean octreeChanged = prevOctree.get() != impl || prevWaterOctree.get() != waterImpl;
+
         boolean needTextureLoad = resetReason == ResetReason.SCENE_LOADED ||
                 resetReason == ResetReason.MATERIALS_CHANGED ||
+                octreeChanged ||
                 prevWorldBvh.get() != worldBvh ||
                 prevActorBvh.get() != actorBvh ||
                 Double.doubleToLongBits(scene.getAnimationTime())
@@ -109,6 +128,8 @@ public abstract class AbstractSceneLoader {
             }
             prevWorldBvh = new WeakReference<>(worldBvh, null);
             prevActorBvh = new WeakReference<>(actorBvh, null);
+
+            texturePalette.setEmission(EmissionResolver.forScene(scene));
 
             // Preload textures
             scene.getPalette().getPalette().forEach(b -> PackedBlock.preloadTextures(b, texturePalette));
@@ -160,34 +181,56 @@ public abstract class AbstractSceneLoader {
         }
 
         // Load world octree (no merge with water — they are kept separate for dual-octree tracing)
-        Octree.OctreeImplementation impl = scene.getWorldOctree().getImplementation();
-        if (resetReason == ResetReason.SCENE_LOADED || prevOctree.get() != impl) {
-            prevOctree = new WeakReference<>(impl, null);
+        boolean uploadWorldOctree = resetReason == ResetReason.SCENE_LOADED || prevOctree.get() != impl;
+        boolean uploadWaterOctree = resetReason == ResetReason.SCENE_LOADED || prevWaterOctree.get() != waterImpl;
+
+        // needTextureLoad subsumes both upload conditions (see octreeChanged
+        // above), so blockMapping is non-null whenever an upload runs. Fail
+        // loudly rather than NPE deep inside the packer if that ever breaks.
+        if ((uploadWorldOctree || uploadWaterOctree) && blockMapping == null) {
+            Log.error("ChunkyCL: internal error — octree upload requested without a block "
+                    + "mapping (reset reason: " + resetReason + "). Skipping GPU scene load; "
+                    + "the render would use stale geometry.");
+            return false;
+        }
+
+        // prevOctree / prevWaterOctree are advanced only AFTER a successful upload.
+        // Recording the new octree up front would mark it as "already uploaded" even
+        // when the upload failed, and since the retry condition IS prevOctree != impl,
+        // nothing would ever re-attempt it — the GPU would render stale geometry for
+        // the rest of the session.
+        // Chunky marks fully enclosed blocks as Octree.ANY_TYPE so that large hidden
+        // patches merge into single leaves. It is not a palette id: the CPU resolves it
+        // to stone (BlockPalette.get(ANY_ID)), and so must the GPU. Passing it through
+        // raw made the kernel index the block palette ~8 GB out of bounds (NVIDIA Xid 31
+        // MMU fault, reported as CL_INVALID_COMMAND_QUEUE / CL_OUT_OF_RESOURCES) as soon
+        // as a ray crossed two adjacent hidden cells.
+        int anyTypeBlock = blockMapping != null ? blockMapping[scene.getPalette().stoneId] : 0;
+
+        if (uploadWorldOctree) {
             if (impl instanceof PackedOctree) {
-                assert blockMapping != null;
                 int[] worldData = ((PackedOctree) impl).treeData;
-                if (!loadOctree(worldData, impl.getDepth(), blockMapping, this.blockPalette))
+                if (!loadOctree(worldData, impl.getDepth(), blockMapping, anyTypeBlock, this.blockPalette))
                     return false;
             } else {
                 Log.error("Octree implementation must be PACKED");
                 return false;
             }
+            prevOctree = new WeakReference<>(impl, null);
         }
 
         // Load water octree separately (CPU keeps world and water octrees independent)
-        Octree.OctreeImplementation waterImpl = scene.getWaterOctree().getImplementation();
-        if (resetReason == ResetReason.SCENE_LOADED || prevWaterOctree.get() != waterImpl) {
-            prevWaterOctree = new WeakReference<>(waterImpl, null);
+        if (uploadWaterOctree) {
             if (waterImpl instanceof PackedOctree && waterImpl.getDepth() == impl.getDepth()) {
-                assert blockMapping != null;
                 int[] waterData = ((PackedOctree) waterImpl).treeData;
-                if (!loadWaterOctree(waterData, waterImpl.getDepth(), blockMapping, this.blockPalette))
+                if (!loadWaterOctree(waterData, waterImpl.getDepth(), blockMapping, anyTypeBlock, this.blockPalette))
                     return false;
             } else {
                 // No water octree or depth mismatch — upload an empty single-leaf tree
-                if (!loadWaterOctree(new int[]{ 0 }, impl.getDepth(), blockMapping != null ? blockMapping : new int[0], this.blockPalette))
+                if (!loadWaterOctree(new int[]{ 0 }, impl.getDepth(), blockMapping, anyTypeBlock, this.blockPalette))
                     return false;
             }
+            prevWaterOctree = new WeakReference<>(waterImpl, null);
         }
 
         this.modCount = modCount;
@@ -264,8 +307,30 @@ public abstract class AbstractSceneLoader {
         return maxDepth;
     }
 
-    protected abstract boolean loadOctree(int[] octree, int depth, int[] blockMapping, ResourcePalette<PackedBlock> blockPalette);
-    protected abstract boolean loadWaterOctree(int[] waterOctree, int depth, int[] blockMapping, ResourcePalette<PackedBlock> blockPalette);
+    protected abstract boolean loadOctree(int[] octree, int depth, int[] blockMapping, int anyTypeBlock, ResourcePalette<PackedBlock> blockPalette);
+    protected abstract boolean loadWaterOctree(int[] waterOctree, int depth, int[] blockMapping, int anyTypeBlock, ResourcePalette<PackedBlock> blockPalette);
+
+    /**
+     * Translates a Chunky packed octree into GPU palette indices. Branch nodes (> 0)
+     * are child offsets and pass through; leaves (<= 0) are negated scene-palette ids.
+     * Octree.ANY_TYPE leaves become {@code anyTypeBlock} (stone, as on the CPU). Any
+     * other id without a mapping becomes air: the kernel uses leaf values as offsets
+     * into the block palette, so an unmapped id must never reach it.
+     */
+    protected static int[] mapOctree(int[] octree, int[] blockMapping, int anyTypeBlock) {
+        int[] mapped = new int[octree.length];
+        for (int n = 0; n < octree.length; n++) {
+            int i = octree[n];
+            if (i > 0) {
+                mapped[n] = i;
+            } else if (-i == Octree.ANY_TYPE) {
+                mapped[n] = -anyTypeBlock;
+            } else {
+                mapped[n] = -i >= blockMapping.length ? 0 : -blockMapping[-i];
+            }
+        }
+        return mapped;
+    }
 
     protected abstract AbstractTextureLoader createTextureLoader();
     protected abstract ResourcePalette<PackedBlock> createBlockPalette();

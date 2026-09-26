@@ -1,5 +1,6 @@
 package dev.thatredox.chunkynative.common.export.texture;
 
+import dev.thatredox.chunkynative.common.emissive.EmissionResolver;
 import dev.thatredox.chunkynative.opencl.renderer.export.textureexporter.TextureExporter;
 import it.unimi.dsi.fastutil.Hash;
 import it.unimi.dsi.fastutil.objects.Object2ObjectMap;
@@ -28,6 +29,20 @@ public abstract class AbstractTextureLoader {
 
     public double getAnimationTime() {
         return this.animationTime;
+    }
+
+    /**
+     * Emission maps and per-block emission settings for the materials packed with this
+     * loader. Set by AbstractSceneLoader before any texture is requested.
+     */
+    protected EmissionResolver emission = EmissionResolver.disabled();
+
+    public void setEmission(EmissionResolver emission) {
+        this.emission = emission;
+    }
+
+    public EmissionResolver getEmission() {
+        return this.emission;
     }
 
     public AbstractTextureLoader() {
@@ -85,6 +100,14 @@ public abstract class AbstractTextureLoader {
         this.identityRecordMap.put(texture, record);
         this.recordMap.put(texture, record);
         return record;
+    }
+
+    /**
+     * The record of a texture that was already requested, or null. Never adds one.
+     */
+    public TextureRecord getIfLoaded(Texture texture) {
+        TextureRecord record = this.identityRecordMap.getOrDefault(texture, null);
+        return record != null ? record : this.recordMap.getOrDefault(texture, null);
     }
 
     /**

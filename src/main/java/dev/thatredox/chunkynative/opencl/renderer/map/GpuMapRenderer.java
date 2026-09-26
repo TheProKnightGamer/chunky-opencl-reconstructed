@@ -19,6 +19,8 @@ import se.llbit.chunky.world.ChunkView;
 import se.llbit.log.Log;
 
 import java.lang.reflect.Field;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.nio.IntBuffer;
 import java.util.Collection;
 
@@ -48,17 +50,36 @@ public class GpuMapRenderer {
     private Field mbCachedField;
     private Field mbImageField;
 
-    // GPU resources (lazily created, reused across frames)
+    // GPU resources (lazily created, reused across frames). Both buffers are
+    // allocated with CL_MEM_ALLOC_HOST_PTR so the driver places them in
+    // pinned host memory; on integrated GPUs (shared RAM) map/unmap is then a
+    // pointer hand-back instead of a full-frame copy in each direction.
     private cl_kernel scaleKernel;
     private cl_mem gpuSrcBuffer;
     private cl_mem gpuDstBuffer;
     private int lastSrcSize;
     private int lastDstSize;
     private WritableImage gpuImage;
-    // Host-side destination scratch reused across frames to avoid a view-sized
-    // allocation per map repaint. Safe: all access is on the FX thread, the
-    // blocking read fully overwrites it, and the caller's setPixels copies it.
+    // One-time downgrade flags: if a driver refuses to map a pinned buffer,
+    // fall back permanently (per context) to plain write/read transfers.
+    private boolean srcMapUploadOk = true;
+    private boolean dstMapReadOk = true;
+    // Host-side destination scratch, only used on the dst read fallback path.
     private int[] dstScratch;
+
+    // Source-content version last uploaded to gpuSrcBuffer. While the version
+    // is unchanged (pure pan/zoom, hover repaints) the upload is skipped
+    // entirely — the kernel re-reads the buffer already resident on the GPU.
+    private long lastUploadedVersion = Long.MIN_VALUE;
+
+    // Parameters of the frame currently held in gpuImage. When both the
+    // content version and all scale parameters match, drawBuffered just
+    // re-blits gpuImage without touching OpenCL at all.
+    private boolean lastDrawnValid = false;
+    private long lastDrawnVersion;
+    private int lastDrawnDstW, lastDrawnDstH;
+    private float lastDrawnScale;
+    private int lastDrawnOffX, lastDrawnOffZ;
 
     // Dedicated command queue: this code runs on the JavaFX Application Thread,
     // so it must NOT share the render thread's queue (concurrent host access to
@@ -200,24 +221,14 @@ public class GpuMapRenderer {
      *
      * @return true on success, false to signal the caller to fall back to CPU
      */
-    boolean gpuDrawBuffered(GraphicsContext gc, MapBuffer delegate) {
+    boolean gpuDrawBuffered(GraphicsContext gc, GpuMapBuffer wrapper) {
         if (!installed) return false;
 
+        MapBuffer delegate = wrapper.getDelegate();
         try {
             synchronized (delegate) {
                 ChunkView view = (ChunkView) mbViewField.get(delegate);
                 if (view.width <= 0 || view.height <= 0) return true; // nothing to draw
-
-                boolean cached = mbCachedField.getBoolean(delegate);
-                if (cached) {
-                    // The image is already up to date – just blit it
-                    WritableImage img = (WritableImage) mbImageField.get(delegate);
-                    if (img != null) {
-                        gc.clearRect(0, 0, view.width, view.height);
-                        gc.drawImage(img, 0, 0);
-                        return true;
-                    }
-                }
 
                 int[] pixels = (int[]) mbPixelsField.get(delegate);
                 int srcWidth  = mbWidthField.getInt(delegate);
@@ -232,18 +243,27 @@ public class GpuMapRenderer {
                 int srcOffsetX = (int) (0.5 + view.chunkScale * (view.x0 - view.px0));
                 int srcOffsetZ = (int) (0.5 + view.chunkScale * (view.z0 - view.pz0));
 
-                int[] scaled = gpuScale(pixels, srcWidth, srcHeight,
-                        dstWidth, dstHeight, scale, srcOffsetX, srcOffsetZ);
-                if (scaled == null) return false; // fall back to CPU
+                long version = wrapper.contentVersion();
 
-                // Write result to a WritableImage
-                if (gpuImage == null
-                        || (int) gpuImage.getWidth() != dstWidth
-                        || (int) gpuImage.getHeight() != dstHeight) {
-                    gpuImage = new WritableImage(dstWidth, dstHeight);
+                // Fast path: identical frame — re-blit without touching OpenCL.
+                if (lastDrawnValid && gpuImage != null
+                        && version == lastDrawnVersion
+                        && dstWidth == lastDrawnDstW && dstHeight == lastDrawnDstH
+                        && scale == lastDrawnScale
+                        && srcOffsetX == lastDrawnOffX && srcOffsetZ == lastDrawnOffZ) {
+                    gc.clearRect(0, 0, dstWidth, dstHeight);
+                    gc.drawImage(gpuImage, 0, 0);
+                    return true;
                 }
-                gpuImage.getPixelWriter().setPixels(
-                        0, 0, dstWidth, dstHeight, PIXEL_FORMAT, scaled, 0, dstWidth);
+
+                // Invalidate up front: if the scale below throws or falls back
+                // to CPU, gpuImage no longer matches the recorded parameters.
+                lastDrawnValid = false;
+
+                if (!gpuScaleToImage(pixels, srcWidth, srcHeight,
+                        dstWidth, dstHeight, scale, srcOffsetX, srcOffsetZ, version)) {
+                    return false; // fall back to CPU
+                }
 
                 // Store back so MapBuffer considers itself cached
                 mbImageField.set(delegate, gpuImage);
@@ -251,6 +271,14 @@ public class GpuMapRenderer {
 
                 gc.clearRect(0, 0, dstWidth, dstHeight);
                 gc.drawImage(gpuImage, 0, 0);
+
+                lastDrawnVersion = version;
+                lastDrawnDstW = dstWidth;
+                lastDrawnDstH = dstHeight;
+                lastDrawnScale = scale;
+                lastDrawnOffX = srcOffsetX;
+                lastDrawnOffZ = srcOffsetZ;
+                lastDrawnValid = true;
                 return true;
             }
         } catch (Exception e) {
@@ -259,11 +287,39 @@ public class GpuMapRenderer {
         }
     }
 
+    /**
+     * Drops the delegate's cached-image flag. Called by {@link GpuMapBuffer} when it
+     * skips a redundant {@code redrawView()} so a CPU fallback would still re-scale
+     * at the current pan offset instead of blitting a stale cached image.
+     */
+    void invalidateDelegateImageCache(MapBuffer delegate) {
+        if (!installed) return;
+        try {
+            mbCachedField.setBoolean(delegate, false);
+        } catch (Exception ignored) {
+            // Field access already worked during install; nothing sensible to do here.
+        }
+    }
+
     // ---- OpenCL nearest-neighbour scaling ----
 
-    private int[] gpuScale(int[] src, int srcWidth, int srcHeight,
-                           int dstWidth, int dstHeight, float scale,
-                           int srcOffsetX, int srcOffsetZ) {
+    /**
+     * Scales the source pixels on the GPU and writes the result into {@link #gpuImage}
+     * (allocating/resizing it as needed).
+     *
+     * <p>The source upload is skipped whenever {@code contentVersion} matches the
+     * version already resident in {@code gpuSrcBuffer} — during pans and zooms only
+     * the kernel parameters change, so the map moves without any host→GPU transfer.
+     * Transfers that do happen go through pinned-memory map/unmap, which on an
+     * integrated GPU is a single memcpy (upload) and a zero-copy read (download)
+     * instead of the double copies of write/read-buffer.
+     *
+     * @return true on success, false to signal the caller to fall back to CPU
+     */
+    private boolean gpuScaleToImage(int[] src, int srcWidth, int srcHeight,
+                                    int dstWidth, int dstHeight, float scale,
+                                    int srcOffsetX, int srcOffsetZ, long contentVersion) {
+        ByteBuffer mappedDst = null;
         try {
             ContextManager ctx = ContextManager.get();
             // Rebuild on first use or after a device switch/reload: the cached
@@ -277,25 +333,71 @@ public class GpuMapRenderer {
             }
             int srcSize = src.length;
             int dstSize = dstWidth * dstHeight;
-            if (dstSize <= 0) return null;
+            if (dstSize <= 0) return false;
 
             // (Re-)allocate GPU buffers when sizes change
             if (gpuSrcBuffer == null || srcSize != lastSrcSize) {
                 if (gpuSrcBuffer != null) clReleaseMemObject(gpuSrcBuffer);
-                gpuSrcBuffer = clCreateBuffer(ctx.context.context, CL_MEM_READ_ONLY,
+                gpuSrcBuffer = clCreateBuffer(ctx.context.context,
+                        CL_MEM_READ_ONLY | CL_MEM_ALLOC_HOST_PTR,
                         (long) Sizeof.cl_int * srcSize, null, null);
                 lastSrcSize = srcSize;
+                lastUploadedVersion = Long.MIN_VALUE; // new buffer is empty
             }
             if (gpuDstBuffer == null || dstSize != lastDstSize) {
                 if (gpuDstBuffer != null) clReleaseMemObject(gpuDstBuffer);
-                gpuDstBuffer = clCreateBuffer(ctx.context.context, CL_MEM_WRITE_ONLY,
+                gpuDstBuffer = clCreateBuffer(ctx.context.context,
+                        CL_MEM_WRITE_ONLY | CL_MEM_ALLOC_HOST_PTR,
                         (long) Sizeof.cl_int * dstSize, null, null);
                 lastDstSize = dstSize;
             }
 
-            // Upload source pixels (blocking – Java arrays are non-direct buffers)
-            clEnqueueWriteBuffer(mapQueue, gpuSrcBuffer, CL_TRUE, 0,
-                    (long) Sizeof.cl_int * srcSize, Pointer.to(src), 0, null, null);
+            // Upload source pixels only when their content actually changed.
+            if (contentVersion != lastUploadedVersion) {
+                boolean uploaded = false;
+                if (srcMapUploadOk) {
+                    int[] err = new int[1];
+                    ByteBuffer mappedSrc = null;
+                    try {
+                        mappedSrc = clEnqueueMapBuffer(mapQueue, gpuSrcBuffer, CL_TRUE,
+                                CL_MAP_WRITE_INVALIDATE_REGION, 0,
+                                (long) Sizeof.cl_int * srcSize, 0, null, null, err);
+                    } catch (CLException clFailure) {
+                        // JOCL has exceptions enabled globally (Device.<clinit>), so
+                        // this — not the errcode-out param — is the normal failure
+                        // path. Carry the REAL status through so a transient error
+                        // isn't mistaken for "this device can't map".
+                        err[0] = clFailure.getStatus();
+                    } catch (Exception mapFailure) {
+                        err[0] = CL_INVALID_OPERATION; // unknown cause: assume unsupported
+                    }
+                    if (mappedSrc != null && err[0] == CL_SUCCESS) {
+                        try {
+                            mappedSrc.order(ByteOrder.nativeOrder()).asIntBuffer().put(src);
+                        } finally {
+                            clEnqueueUnmapMemObject(mapQueue, gpuSrcBuffer, mappedSrc,
+                                    0, null, null);
+                        }
+                        uploaded = true;
+                    } else {
+                        // A driver that hands back both a pointer and an error is
+                        // out of spec, but if it does, the region is still mapped
+                        // to the host — release it rather than leak it forever.
+                        if (mappedSrc != null) {
+                            try {
+                                clEnqueueUnmapMemObject(mapQueue, gpuSrcBuffer, mappedSrc,
+                                        0, null, null);
+                            } catch (Exception ignored) { }
+                        }
+                        latchSrcMapUnsupported(err[0]);
+                    }
+                }
+                if (!uploaded) {
+                    clEnqueueWriteBuffer(mapQueue, gpuSrcBuffer, CL_TRUE, 0,
+                            (long) Sizeof.cl_int * srcSize, Pointer.to(src), 0, null, null);
+                }
+                lastUploadedVersion = contentVersion;
+            }
 
             // Create kernel on first use
             if (scaleKernel == null) {
@@ -316,17 +418,99 @@ public class GpuMapRenderer {
             clEnqueueNDRangeKernel(mapQueue, scaleKernel, 1,
                     null, new long[]{dstSize}, null, 0, null, null);
 
-            // Blocking read – waits for kernel to finish
-            if (dstScratch == null || dstScratch.length != dstSize) {
-                dstScratch = new int[dstSize];
+            if (gpuImage == null
+                    || (int) gpuImage.getWidth() != dstWidth
+                    || (int) gpuImage.getHeight() != dstHeight) {
+                gpuImage = new WritableImage(dstWidth, dstHeight);
             }
-            clEnqueueReadBuffer(mapQueue, gpuDstBuffer, CL_TRUE, 0,
-                    (long) Sizeof.cl_int * dstSize, Pointer.to(dstScratch), 0, null, null);
-            return dstScratch;
+
+            if (dstMapReadOk) {
+                // Blocking map waits for the kernel; on pinned memory this is a
+                // pointer hand-back, and setPixels copies straight out of it.
+                int[] err = new int[1];
+                try {
+                    mappedDst = clEnqueueMapBuffer(mapQueue, gpuDstBuffer, CL_TRUE,
+                            CL_MAP_READ, 0, (long) Sizeof.cl_int * dstSize,
+                            0, null, null, err);
+                } catch (CLException clFailure) {
+                    // See the upload path: with JOCL exceptions enabled this is the
+                    // normal failure route, so preserve the real status code.
+                    err[0] = clFailure.getStatus();
+                } catch (Exception mapFailure) {
+                    err[0] = CL_INVALID_OPERATION; // unknown cause: assume unsupported
+                }
+                if (mappedDst != null && err[0] != CL_SUCCESS) {
+                    // Out-of-spec driver: pointer AND error. Unmap so the buffer
+                    // doesn't stay host-owned for the rest of the context's life.
+                    try {
+                        clEnqueueUnmapMemObject(mapQueue, gpuDstBuffer, mappedDst,
+                                0, null, null);
+                    } catch (Exception ignored) { }
+                    mappedDst = null;
+                }
+                if (mappedDst == null) {
+                    latchDstMapUnsupported(err[0]);
+                }
+            }
+            if (mappedDst != null) {
+                gpuImage.getPixelWriter().setPixels(0, 0, dstWidth, dstHeight, PIXEL_FORMAT,
+                        mappedDst.order(ByteOrder.nativeOrder()).asIntBuffer(), dstWidth);
+            } else {
+                // Fallback: blocking read into reusable scratch, then copy.
+                if (dstScratch == null || dstScratch.length != dstSize) {
+                    dstScratch = new int[dstSize];
+                }
+                clEnqueueReadBuffer(mapQueue, gpuDstBuffer, CL_TRUE, 0,
+                        (long) Sizeof.cl_int * dstSize, Pointer.to(dstScratch), 0, null, null);
+                gpuImage.getPixelWriter().setPixels(
+                        0, 0, dstWidth, dstHeight, PIXEL_FORMAT, dstScratch, 0, dstWidth);
+            }
+            return true;
 
         } catch (Exception e) {
             Log.warn("ChunkyCL: GPU mapScale kernel failed; this frame will fall back to CPU", e);
-            return null;
+            // The source buffer may be partially written; force a re-upload.
+            lastUploadedVersion = Long.MIN_VALUE;
+            return false;
+        } finally {
+            if (mappedDst != null) {
+                try {
+                    clEnqueueUnmapMemObject(mapQueue, gpuDstBuffer, mappedDst, 0, null, null);
+                } catch (Exception ignored) {
+                    // Queue may already be dead on a context swap; nothing to do.
+                }
+            }
+        }
+    }
+
+    /**
+     * Decide whether a failed buffer map means "this driver does not support
+     * mapping" (latch the fallback permanently for this context) or was merely
+     * transient (fall back for this frame only, and retry next frame).
+     *
+     * <p>The distinction matters because the map queue shares a device with the
+     * render queue: a GPU watchdog reset triggered by a heavy render surfaces here
+     * as CL_OUT_OF_RESOURCES, and latching on that would silently and permanently
+     * downgrade the map path for a reason that has nothing to do with the map.
+     */
+    private static boolean isMapUnsupported(int err) {
+        return err == CL_INVALID_OPERATION || err == CL_INVALID_VALUE
+                || err == CL_MAP_FAILURE;
+    }
+
+    private void latchSrcMapUnsupported(int err) {
+        if (isMapUnsupported(err)) {
+            srcMapUploadOk = false;
+            Log.info("ChunkyCL: this device does not support mapped uploads for the 2D "
+                    + "map (error " + err + "); using plain buffer writes instead.");
+        }
+    }
+
+    private void latchDstMapUnsupported(int err) {
+        if (isMapUnsupported(err)) {
+            dstMapReadOk = false;
+            Log.info("ChunkyCL: this device does not support mapped readback for the 2D "
+                    + "map (error " + err + "); using plain buffer reads instead.");
         }
     }
 
@@ -339,6 +523,11 @@ public class GpuMapRenderer {
         dstScratch = null;
         lastSrcSize = 0;
         lastDstSize = 0;
+        lastUploadedVersion = Long.MIN_VALUE;
+        lastDrawnValid = false;
+        // A new context may support mapping even if the old one didn't.
+        srcMapUploadOk = true;
+        dstMapReadOk = true;
     }
 
     /** Release GPU resources. */

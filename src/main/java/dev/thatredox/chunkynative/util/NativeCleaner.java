@@ -34,6 +34,12 @@ public class NativeCleaner extends Thread {
 
     public NativeCleaner(String name) {
         super(name);
+        // Daemon: this thread must never keep the JVM alive. As a user thread it made
+        // headless `chunky -render` hang forever after the render finished (Chunky's
+        // main returns without System.exit on success). Anything still queued at exit
+        // is freed with the process, and ContextManager's shutdown hook releases the
+        // OpenCL contexts.
+        this.setDaemon(true);
         this.start();
     }
 
