@@ -40,13 +40,22 @@ import static org.jocl.CL.*;
  * <pre>
  *   sceneDir=... scene=...          scene to load (a Chunky scenes directory + name)
  *   variants=V1;V2;...              V = includeDir[|extra build options[|key=val,...]]
- *                                   per-variant keys: wg=N (local size), global=N, matCache=N, diag=1
+ *                                   per-variant keys: wg=N (local size), global=N, matCache=N, diag=1,
+ *                                   wf=1 (wavefront kernels instead of render), ext=N / con=N
+ *                                   (register caps of the wfExtend / wfConnect programs),
+ *                                   capture=1 (see traceReps)
  *   names=a,b,...                   display names for the variants
  *   ipl=N passes=N rounds=N slices=N wg=N global=N   dispatch shape (defaults 1/4/3/1/0/262144)
  *   width=/height= branch= rayDepth= emitters=0|1 emitterStrategy=N sunStrategy=NAME
  *   refSpp=N out=dir                image-comparison frames; write PNG + raw floats to dir
  *   preview=1                       also run + compare the preview kernel
  *   compileOnly=1                   only build variants into the binary cache (1 core, no GPU work)
+ *   wfChunk=N wfGlobal=N            wavefront: pixels per chunk (default the frame), work-items per launch
+ *   wfProfile=1                     wavefront: GPU time per kernel for one frame
+ *   traceReps=N traceGlobal= traceWg=  capture=1 variants: the render kernel takes a trailing float
+ *                                   buffer it fills with one frame's first bounce rays, and the program's
+ *                                   traceCaptured kernel re-traces them alone (how the wavefront split
+ *                                   was justified: isolated tracing ran 1.9-3.8x faster per ray)
  *   cache=dir                       binary cache (keyed by inlined source + options)
  * </pre>
  * A variant with diag=1 must take a trailing {@code __global uint*} argument; the kernel
@@ -68,9 +77,14 @@ public class ClBench {
 
     static class Variant {
         String name, dir, opts;
+        String entry = "rayTracer.c"; // program source file in dir
         long wg = -1;         // local size override (-1 = global setting)
         int matCache = -1;    // LDS material cache words override (-1 = global setting)
         boolean diag = false; // kernel takes a trailing SIMT-diagnostic buffer
+        boolean capture = false; // kernel takes a trailing ray-capture buffer; program has traceCaptured
+        boolean wf = false;      // wavefront kernels: wavefront.c + wfExtend.c + wfConnect.c
+        cl_kernel wfPrimary, wfShade, wfExtend, wfFinish, wfConnect;
+        int extRegs = 0, conRegs = 0; // register caps for separately built extend / connect programs
         long global = -1;     // global work size cap override (-1 = global setting)
         cl_program prog;
         cl_kernel kernel;
@@ -106,6 +120,10 @@ public class ClBench {
                     if (q[0].equals("wg")) var.wg = Long.parseLong(q[1]);
                     if (q[0].equals("matCache")) var.matCache = Integer.parseInt(q[1]);
                     if (q[0].equals("diag")) var.diag = true;
+                    if (q[0].equals("capture")) var.capture = true;
+                    if (q[0].equals("wf")) var.wf = true;
+                    if (q[0].equals("ext")) var.extRegs = Integer.parseInt(q[1]);
+                    if (q[0].equals("con")) var.conRegs = Integer.parseInt(q[1]);
                     if (q[0].equals("global")) var.global = Long.parseLong(q[1]);
                 }
             }
@@ -135,7 +153,13 @@ public class ClBench {
         if (A.containsKey("compileOnly")) {
             ClContext cctx = new ClContext(Device.getPreferredDevice());
             for (Variant var : variants) {
-                if (build(cctx, var) == null) throw new RuntimeException("build failed: " + var.name);
+                var.prog = build(cctx, var);
+                if (var.prog == null) throw new RuntimeException("build failed: " + var.name);
+                if (var.wf) {
+                    entryProgram(cctx, var, "wavefront.c", 0);
+                    entryProgram(cctx, var, "wfExtend.c", var.extRegs);
+                    entryProgram(cctx, var, "wfConnect.c", var.conRegs);
+                }
             }
             return;
         }
@@ -210,7 +234,20 @@ public class ClBench {
                 Pointer.to(new float[]{(float) scene.getEmitterIntensity()}), null);
         cl_mem out = clCreateBuffer(ctx.context, CL_MEM_READ_WRITE, (long) Sizeof.cl_float * 4 * pixelCount, null, null);
         cl_mem diagBuf = clCreateBuffer(ctx.context, CL_MEM_READ_WRITE, 64 * 4, null, null);
+        boolean anyCapture = variants.stream().anyMatch(v -> v.capture);
+        cl_mem captureBuf = anyCapture ? clCreateBuffer(ctx.context, CL_MEM_READ_WRITE, (long) pixelCount * 12 * 4, null, null) : null;
+        cl_mem hitsBuf = anyCapture ? clCreateBuffer(ctx.context, CL_MEM_READ_WRITE, (long) pixelCount * 4, null, null) : null;
         KEEP_ALIVE.addAll(Arrays.asList(ctx, loader, camera, canvas, rayDepthBuf, empty, dyn, emitterI, out, diagBuf, scene));
+        if (anyCapture) KEEP_ALIVE.addAll(Arrays.asList(captureBuf, hitsBuf));
+        boolean anyWf = variants.stream().anyMatch(v -> v.wf);
+        WF_EFF_DEPTH = Math.max(0, scene.getRayDepth() - 1);
+        WF_BRANCH = branch;
+        WF_GLOBAL = iarg("wfGlobal", 65536);
+        WF_CHUNK = Math.min(pixelCount, iarg("wfChunk", pixelCount));
+        // WF_FIELDS in kernel/wavefront.h floats per pixel of the chunk.
+        cl_mem wfState = anyWf ? clCreateBuffer(ctx.context, CL_MEM_READ_WRITE,
+                (long) WF_CHUNK * iarg("wfFields", 108) * 4, null, null) : null;
+        if (anyWf) KEEP_ALIVE.add(wfState);
         int matCacheWords = Math.min(iarg("matCache", 8192), loader.getMaterialPalette().wordCount());
 
         int ipl = iarg("ipl", 1);
@@ -224,12 +261,30 @@ public class ClBench {
             int mc = var.matCache >= 0 ? Math.min(var.matCache, loader.getMaterialPalette().wordCount()) : matCacheWords;
             setArgs(var.kernel, camera, loader, empty, dyn, emitterI, canvas, rayDepthBuf, mc, out, ipl, pixelCount);
             if (var.diag) mem(var.kernel, RENDER_ARGS, diagBuf);
+            if (var.capture) mem(var.kernel, RENDER_ARGS, captureBuf);
+            if (var.wf) {
+                cl_program wprog = entryProgram(ctx, var, "wavefront.c", 0);
+                var.wfPrimary = clCreateKernel(wprog, "wfPrimary", null);
+                var.wfShade = clCreateKernel(wprog, "wfShade", null);
+                var.wfFinish = clCreateKernel(wprog, "wfFinish", null);
+                var.wfExtend = clCreateKernel(entryProgram(ctx, var, "wfExtend.c", var.extRegs), "wfExtend", null);
+                var.wfConnect = clCreateKernel(entryProgram(ctx, var, "wfConnect.c", var.conRegs), "wfConnect", null);
+                for (cl_kernel k : new cl_kernel[]{var.wfPrimary, var.wfShade, var.wfExtend, var.wfFinish, var.wfConnect}) {
+                    KEEP_ALIVE.add(k);
+                    setArgs(k, camera, loader, empty, dyn, emitterI, canvas, rayDepthBuf, 0, out, ipl, pixelCount);
+                    mem(k, RENDER_ARGS, wfState);
+                    long[] pv = new long[1];
+                    clGetKernelWorkGroupInfo(k, device.device, CL_KERNEL_PRIVATE_MEM_SIZE, Sizeof.cl_ulong, Pointer.to(pv), null);
+                    String[] nm = new String[1];
+                    System.out.printf("  wf kernel private=%dB%n", pv[0]);
+                }
+            }
         }
 
         // Warm-up each variant (materialise buffers, clocks).
         for (Variant var : variants) {
             long t = System.nanoTime();
-            renderFrame(ctx, var.kernel, pixelCount, slices, var.wg >= 0 ? var.wg : wg, var.global > 0 ? var.global : gcap);
+            frame(ctx, var, pixelCount, slices, var.wg >= 0 ? var.wg : wg, var.global > 0 ? var.global : gcap);
             clFinish(ctx.queue);
             System.out.printf("warm-up %-28s %.0f ms%n", var.name, (System.nanoTime() - t) / 1e6);
         }
@@ -238,7 +293,7 @@ public class ClBench {
             for (Variant var : variants) {
                 long t = System.nanoTime();
                 for (int p = 0; p < passes; p++) {
-                    renderFrame(ctx, var.kernel, pixelCount, slices, var.wg >= 0 ? var.wg : wg, var.global > 0 ? var.global : gcap);
+                    frame(ctx, var, pixelCount, slices, var.wg >= 0 ? var.wg : wg, var.global > 0 ? var.global : gcap);
                 }
                 clFinish(ctx.queue);
                 var.msPerPass.add((System.nanoTime() - t) / 1e6 / passes);
@@ -256,12 +311,87 @@ public class ClBench {
                     var.name, med, s.get(0), samples / med / 1e3, baseMed / med, fmt(var.msPerPass));
         }
 
+        // ---- wfProfile=1: per-kernel GPU time of one wavefront frame (profiling queue) ----
+        if (A.containsKey("wfProfile")) {
+            cl_queue_properties qp = new cl_queue_properties();
+            qp.addProperty(CL_QUEUE_PROPERTIES, CL_QUEUE_PROFILING_ENABLE);
+            cl_command_queue pq = clCreateCommandQueueWithProperties(ctx.context, device.device, qp, null);
+            KEEP_ALIVE.add(pq);
+            for (Variant var : variants) {
+                if (!var.wf) continue;
+                WF_PROFILE = new LinkedHashMap<>();
+                WF_QUEUE = pq;
+                frame(ctx, var, pixelCount, slices, var.wg >= 0 ? var.wg : wg, var.global > 0 ? var.global : gcap);
+                clFinish(pq);
+                double total = 0;
+                StringBuilder sb = new StringBuilder("WFPROF " + var.name + ":");
+                for (Map.Entry<String, List<cl_event>> e : WF_PROFILE.entrySet()) {
+                    double ms = 0;
+                    for (cl_event ev : e.getValue()) {
+                        long[] ts0 = new long[1], ts1 = new long[1];
+                        clGetEventProfilingInfo(ev, CL_PROFILING_COMMAND_START, Sizeof.cl_ulong, Pointer.to(ts0), null);
+                        clGetEventProfilingInfo(ev, CL_PROFILING_COMMAND_END, Sizeof.cl_ulong, Pointer.to(ts1), null);
+                        ms += (ts1[0] - ts0[0]) / 1e6;
+                        clReleaseEvent(ev);
+                    }
+                    total += ms;
+                    sb.append(String.format("  %s %.1f ms (%d)", e.getKey(), ms, e.getValue().size()));
+                }
+                System.out.println(sb.append(String.format("  total %.1f ms", total)));
+                WF_PROFILE = null;
+                WF_QUEUE = null;
+            }
+        }
+
+        // ---- capture=1: re-trace one frame's first bounce rays in a standalone kernel ----
+        for (Variant var : variants) {
+            if (!var.capture) continue;
+            frame(ctx, var, pixelCount, slices, var.wg >= 0 ? var.wg : wg, var.global > 0 ? var.global : gcap);
+            clFinish(ctx.queue);
+            cl_kernel tk = clCreateKernel(var.prog, "traceCaptured", null);
+            KEEP_ALIVE.add(tk);
+            long[] pv = new long[1];
+            clGetKernelWorkGroupInfo(tk, device.device, CL_KERNEL_PRIVATE_MEM_SIZE, Sizeof.cl_ulong, Pointer.to(pv), null);
+            setArgs(tk, camera, loader, empty, dyn, emitterI, canvas, rayDepthBuf, 0, out, ipl, pixelCount);
+            mem(tk, RENDER_ARGS, captureBuf);
+            mem(tk, RENDER_ARGS + 1, hitsBuf);
+            int reps = iarg("traceReps", 10);
+            for (String gs : arg("traceGlobal", "262144," + pixelCount).split(",")) {
+                long g = Long.parseLong(gs);
+                for (String ws : arg("traceWg", "0,64,128").split(",")) {
+                    long lw = Long.parseLong(ws);
+                    long gg = lw > 0 ? ((g + lw - 1) / lw) * lw : g;
+                    setIntArg(tk, 41, 0);
+                    setIntArg(tk, 42, (int) gg);
+                    long[] global = {gg};
+                    long[] local = lw > 0 ? new long[]{lw} : null;
+                    clEnqueueNDRangeKernel(ctx.queue, tk, 1, null, global, local, 0, null, null);
+                    clFinish(ctx.queue);
+                    List<Double> ts = new ArrayList<>();
+                    for (int r = 0; r < reps; r++) {
+                        long t = System.nanoTime();
+                        clEnqueueNDRangeKernel(ctx.queue, tk, 1, null, global, local, 0, null, null);
+                        clFinish(ctx.queue);
+                        ts.add((System.nanoTime() - t) / 1e6);
+                    }
+                    Collections.sort(ts);
+                    float[] hits = new float[pixelCount];
+                    clEnqueueReadBuffer(ctx.queue, hitsBuf, CL_TRUE, 0, (long) pixelCount * 4, Pointer.to(hits), 0, null, null);
+                    long valid = 0, hit = 0;
+                    for (float hd : hits) { if (hd != -2.0f) valid++; if (hd >= 0) hit++; }
+                    double med = ts.get(ts.size() / 2);
+                    System.out.printf("TRACE %-20s global=%-8d wg=%-4d private=%dB  %.2f ms  rays=%d (hit %d)  %.1f Mrays/s%n",
+                            var.name, gg, lw, pv[0], med, valid, hit, valid / med / 1e3);
+                }
+            }
+        }
+
         // ---- SIMT diagnostic: average active lanes per trace site over one frame ----
         String[] siteNames = {"camera", "bounce", "shadowSeg", "sunNEE", "waterNEE", "s5", "s6", "s7"};
         for (Variant var : variants) {
             if (!var.diag) continue;
             clEnqueueFillBuffer(ctx.queue, diagBuf, Pointer.to(new int[]{0}), 4, 0, 64 * 4, 0, null, null);
-            renderFrame(ctx, var.kernel, pixelCount, slices, var.wg >= 0 ? var.wg : wg, var.global > 0 ? var.global : gcap);
+            frame(ctx, var, pixelCount, slices, var.wg >= 0 ? var.wg : wg, var.global > 0 ? var.global : gcap);
             int[] d = new int[16];
             clEnqueueReadBuffer(ctx.queue, diagBuf, CL_TRUE, 0, 64, Pointer.to(d), 0, null, null);
             StringBuilder sb = new StringBuilder("DIAG " + var.name + ":");
@@ -282,7 +412,7 @@ public class ClBench {
             for (int f = 0; f < refSpp; f++) {
                 cfg[0] = 777 + f * 7919;
                 clEnqueueWriteBuffer(ctx.queue, dyn.get(), CL_TRUE, 0, Sizeof.cl_int * 5, Pointer.to(cfg), 0, null, null);
-                renderFrame(ctx, var.kernel, pixelCount, slices, var.wg >= 0 ? var.wg : wg, var.global > 0 ? var.global : gcap);
+                frame(ctx, var, pixelCount, slices, var.wg >= 0 ? var.wg : wg, var.global > 0 ? var.global : gcap);
                 clEnqueueReadBuffer(ctx.queue, out, CL_TRUE, 0, (long) pixelCount * 16, Pointer.to(bb), 0, null, null);
                 for (int i = 0; i < pixelCount * 4; i++) acc[i] += fb.get(i) / refSpp;
             }
@@ -565,6 +695,82 @@ public class ClBench {
         if (a != RENDER_ARGS) throw new IllegalStateException("arg count " + a);
     }
 
+    static int WF_EFF_DEPTH, WF_BRANCH, WF_GLOBAL, WF_CHUNK;
+    // Another program file of the variant's sources (production wavefront kernels),
+    // optionally with its own register cap.
+    static cl_program entryProgram(ClContext ctx, Variant var, String entry, int regs) throws Exception {
+        Variant v = new Variant();
+        v.dir = var.dir;
+        v.entry = entry;
+        v.opts = regs > 0 ? (var.opts.replaceAll("-cl-nv-maxrregcount=\\d+", "") + " -cl-nv-maxrregcount=" + regs).trim() : var.opts;
+        v.name = var.name + "/" + entry + (regs > 0 ? "/r" + regs : "");
+        cl_program p = build(ctx, v);
+        if (p == null) throw new RuntimeException("build failed: " + v.name);
+        KEEP_ALIVE.add(p);
+        return p;
+    }
+
+    // Wavefront frame, as OpenClPathTracingRenderer.dispatchWavefrontPass: chunks of WF_CHUNK pixels, each running
+    // wfPrimary per iteration, then per branch and bounce wfExtend / wfShade /
+    // wfConnect, then wfFinish. Args after the render params: st, chunkBase,
+    // chunkCap, step.
+    static void wfFrame(ClContext ctx, Variant var, int pixelCount, long wg) {
+        int ipl = iarg("ipl", 1);
+        int cap = WF_CHUNK;
+        long gran = wg > 0 ? wg : 256;
+        long g = WF_GLOBAL;
+        g = Math.max(gran, ((g + gran - 1) / gran) * gran);
+        long[] global = {g};
+        long[] local = wg > 0 ? new long[]{wg} : null;
+        cl_kernel[] all = {var.wfPrimary, var.wfShade, var.wfExtend, var.wfConnect, var.wfFinish};
+        int depths = Math.max(WF_EFF_DEPTH, 1);
+        for (int base = 0; base < pixelCount; base += cap) {
+            int end = Math.min(pixelCount, base + cap);
+            for (cl_kernel k : all) {
+                setIntArg(k, 41, base);
+                setIntArg(k, 42, (int) g);
+                setIntArg(k, 43, end);
+                setIntArg(k, RENDER_ARGS + 1, base);
+                setIntArg(k, RENDER_ARGS + 2, cap);
+                setIntArg(k, RENDER_ARGS + 3, 0);
+            }
+            for (int it = 0; it < ipl; it++) {
+                setIntArg(var.wfPrimary, RENDER_ARGS + 3, it);
+                wfLaunch(ctx, "primary", var.wfPrimary, global, local);
+                for (int b = 0; b < WF_BRANCH; b++) {
+                    for (int d = 0; d < depths; d++) {
+                        if (d > 0) wfLaunch(ctx, "extend" + d, var.wfExtend, global, local);
+                        setIntArg(var.wfShade, RENDER_ARGS + 3, d);
+                        wfLaunch(ctx, "shade" + d, var.wfShade, global, local);
+                        wfLaunch(ctx, "connect" + d, var.wfConnect, global, local);
+                    }
+                }
+            }
+            wfLaunch(ctx, "finish", var.wfFinish, global, local);
+        }
+    }
+
+    static Map<String, List<cl_event>> WF_PROFILE = null;
+    static cl_command_queue WF_QUEUE = null;
+
+    static void wfLaunch(ClContext ctx, String name, cl_kernel k, long[] global, long[] local) {
+        if (WF_PROFILE == null) {
+            clEnqueueNDRangeKernel(ctx.queue, k, 1, null, global, local, 0, null, null);
+        } else {
+            cl_event ev = new cl_event();
+            clEnqueueNDRangeKernel(WF_QUEUE, k, 1, null, global, local, 0, null, ev);
+            WF_PROFILE.computeIfAbsent(name, x -> new ArrayList<>()).add(ev);
+        }
+    }
+
+    static void frame(ClContext ctx, Variant var, int pixelCount, int slices, long wg, long gcap) {
+        if (!var.wf) {
+            renderFrame(ctx, var.kernel, pixelCount, slices, wg, gcap);
+            return;
+        }
+        wfFrame(ctx, var, pixelCount, wg);
+    }
+
     // Same interleaved slicing as OpenClPathTracingRenderer.dispatchFrame.
     static void renderFrame(ClContext ctx, cl_kernel k, int pixelCount, int slices, long wg, long gcap) {
         long ideal = Math.max(1L, (long) pixelCount / Math.max(1L, (long) slices * 16));
@@ -588,6 +794,7 @@ public class ClBench {
             String inc = m.group(1);
             String rep;
             if (inc.equals("../opencl.h")) rep = "// (opencl.h stripped)";
+            else if (inc.startsWith("frag_")) rep = inline(dir, inc, seen); // fragments repeat
             else if (seen.add(inc)) rep = inline(dir, inc, seen);
             else rep = "// (already included " + inc + ")";
             m.appendReplacement(sb, Matcher.quoteReplacement(rep));
@@ -599,7 +806,7 @@ public class ClBench {
     // Program build with a binary cache keyed by (inlined source, options). NVIDIA builds of
     // the render kernel take 30-120 s, so timing runs should only ever hit this cache.
     static cl_program build(ClContext ctx, Variant var) throws Exception {
-        String src = inline(Paths.get(var.dir), "rayTracer.c", new HashSet<>());
+        String src = inline(Paths.get(var.dir), var.entry, new HashSet<>());
         String opts = BASE_OPTS + (var.opts.isEmpty() ? "" : " " + var.opts);
         MessageDigest md = MessageDigest.getInstance("SHA-256");
         md.update(src.getBytes());
@@ -632,7 +839,7 @@ public class ClBench {
         StringBuilder brief = new StringBuilder();
         boolean inRender = false;
         for (String line : logs.split("\n")) {
-            if (line.contains("entry function")) inRender = line.contains("'render'");
+            if (line.contains("entry function")) inRender = line.contains("'render'") || line.contains("'traceCaptured'") || line.contains("'wf");
             if (inRender && (line.contains("stack frame") || line.contains("Used "))) brief.append("   ").append(line.trim()).append('\n');
             if (line.contains("error")) brief.append("   ").append(line.trim()).append('\n');
         }

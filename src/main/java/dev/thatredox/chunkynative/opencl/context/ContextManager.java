@@ -24,6 +24,12 @@ public class ContextManager {
      * fall back to the CPU-blend path in that case.
      */
     public final Accumulator accumulator;
+    /**
+     * Wavefront path-tracing programs (kernel/wavefront.h). Null when disabled for
+     * this device or when they failed to build; the renderer then uses the render
+     * megakernel for everything.
+     */
+    public final Wavefront wavefront;
 
     public final ClSceneLoader sceneLoader;
 
@@ -66,9 +72,20 @@ public class ContextManager {
                 return null;
             }
         });
+        CompletableFuture<Wavefront> wavefrontFuture = CompletableFuture.supplyAsync(() -> {
+            if (!Wavefront.enabledFor(device)) return null;
+            try {
+                return new Wavefront(context);
+            } catch (Exception e) {
+                Log.warn("ChunkyCL: wavefront kernels unavailable (" + e.getMessage()
+                        + "); rendering with the single-kernel path tracer.");
+                return null;
+            }
+        });
         this.tonemap = tonemapFuture.join();
         this.renderer = rendererFuture.join();
         this.accumulator = accumulatorFuture.join();
+        this.wavefront = wavefrontFuture.join();
         this.sceneLoader = new ClSceneLoader(context);
     }
 
@@ -80,6 +97,7 @@ public class ContextManager {
                 org.jocl.CL.clReleaseProgram(renderer.kernel);
             if (accumulator != null && accumulator.kernel != null)
                 org.jocl.CL.clReleaseProgram(accumulator.kernel);
+            if (wavefront != null) wavefront.release();
             if (context != null) {
                 if (context.queue != null)
                     org.jocl.CL.clReleaseCommandQueue(context.queue);
@@ -204,6 +222,46 @@ public class ContextManager {
 
         private Renderer(ClContext context) {
             this.kernel = KernelLoader.loadProgram(context, "kernel", "rayTracer.c");
+        }
+    }
+
+    /**
+     * The wavefront path tracer's programs (see kernel/wavefront.h): the trace
+     * (extend) and shadow (connect) kernels are separate programs so each gets
+     * its own register cap on NVIDIA.
+     *
+     * <p>On by default: it rendered 1.14-1.58x faster than the megakernel on an
+     * RTX 3070 and 1.07-1.59x on an Intel UHD 770 (same images).
+     * -Dchunkycl.wavefront=false turns it off; a build failure falls back too.
+     */
+    public static class Wavefront {
+        /** Register caps measured best on an RTX 3070 (80-128 tried). */
+        private static final int EXTEND_NV_MAX_REGISTERS = 80;
+        private static final int CONNECT_NV_MAX_REGISTERS = 96;
+
+        /** wfPrimary, wfShade, wfFinish. */
+        public final cl_program shade;
+        /** wfExtend. */
+        public final cl_program extend;
+        /** wfConnect. */
+        public final cl_program connect;
+
+        private Wavefront(ClContext context) {
+            this.shade = KernelLoader.loadProgram(context, "kernel", "wavefront.c");
+            this.extend = KernelLoader.loadProgram(context, "kernel", "wfExtend.c",
+                    Integer.getInteger("chunkycl.wavefront.extendRegisters", EXTEND_NV_MAX_REGISTERS));
+            this.connect = KernelLoader.loadProgram(context, "kernel", "wfConnect.c",
+                    Integer.getInteger("chunkycl.wavefront.connectRegisters", CONNECT_NV_MAX_REGISTERS));
+        }
+
+        static boolean enabledFor(Device device) {
+            return !"false".equalsIgnoreCase(System.getProperty("chunkycl.wavefront", "true"));
+        }
+
+        private void release() {
+            for (cl_program p : new cl_program[]{shade, extend, connect}) {
+                if (p != null) org.jocl.CL.clReleaseProgram(p);
+            }
         }
     }
 

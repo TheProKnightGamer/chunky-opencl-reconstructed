@@ -40,16 +40,26 @@ public class ClContext {
     private static final int DEFAULT_NV_MAX_REGISTERS = 128;
 
     /**
-     * Device-specific code-generation options. NVIDIA generates machine code
-     * (ptxas) when a program is LINKED or built from a cached binary, not when it
-     * is compiled, so these must reach every one of those calls: passed to
-     * clCompileProgram alone they are silently ignored.
+     * Build options of one program. The device options are code-generation
+     * options: NVIDIA generates machine code (ptxas) when a program is LINKED or
+     * built from a cached binary, not when it is compiled, so they must reach
+     * every one of those calls; passed to clCompileProgram alone they are
+     * silently ignored. compile and link are part of the binary-cache key.
      */
-    private final String deviceOptions;
-    /** COMPILE_OPTIONS plus the device options. Part of the binary-cache key. */
-    private final String compileOptions;
-    /** LINK_OPTIONS plus the device options. Part of the binary-cache key. */
-    private final String linkOptions;
+    private static final class BuildOptions {
+        final String device;
+        final String compile;
+        final String link;
+
+        BuildOptions(String deviceOptions) {
+            this.device = deviceOptions.trim();
+            this.compile = (COMPILE_OPTIONS + " " + device).trim();
+            this.link = (LINK_OPTIONS + " " + device).trim();
+        }
+    }
+
+    /** Options for programs that don't ask for their own register cap. */
+    private final BuildOptions defaultOptions;
 
     public ClContext(Device device) {
         this.device = device;
@@ -61,9 +71,8 @@ public class ClContext {
 
 
         this.queue = createCommandQueue();
-        this.deviceOptions = deviceOptionsFor(device).trim();
-        this.compileOptions = (COMPILE_OPTIONS + " " + deviceOptions).trim();
-        this.linkOptions = (LINK_OPTIONS + " " + deviceOptions).trim();
+        this.defaultOptions = new BuildOptions(
+                deviceOptionsFor(device, Integer.getInteger("chunkycl.nvMaxRegisters", DEFAULT_NV_MAX_REGISTERS)));
 
         // Check if version is behind
         int[] version = device.version();
@@ -72,9 +81,8 @@ public class ClContext {
         }
     }
 
-    private static String deviceOptionsFor(Device device) {
+    private static String deviceOptionsFor(Device device, int maxRegisters) {
         if (!device.supportsNvCompilerOptions()) return "";
-        int maxRegisters = Integer.getInteger("chunkycl.nvMaxRegisters", DEFAULT_NV_MAX_REGISTERS);
         return maxRegisters > 0 ? " -cl-nv-maxrregcount=" + maxRegisters : "";
     }
 
@@ -113,6 +121,19 @@ public class ClContext {
      * @return OpenCL program.
      */
     public cl_program loadProgram(Function<String, String> sourceReader, String kernelName) {
+        return loadProgram(sourceReader, kernelName, defaultOptions);
+    }
+
+    /**
+     * {@link #loadProgram(Function, String)} with its own NVIDIA register cap
+     * (ignored on other devices). The wavefront kernels are small enough to run
+     * with fewer registers than the render kernel, i.e. more warps per SM.
+     */
+    public cl_program loadProgram(Function<String, String> sourceReader, String kernelName, int nvMaxRegisters) {
+        return loadProgram(sourceReader, kernelName, new BuildOptions(deviceOptionsFor(device, nvMaxRegisters)));
+    }
+
+    private cl_program loadProgram(Function<String, String> sourceReader, String kernelName, BuildOptions options) {
         // --- Phase 1: Collect all source strings ---
         // TreeMap gives deterministic iteration order for hashing
         TreeMap<String, String> allSources = new TreeMap<>();
@@ -136,8 +157,8 @@ public class ClContext {
         }
 
         // --- Phase 2: Check binary cache ---
-        String cacheKey = computeCacheKey(allSources);
-        cl_program cached = loadCachedBinary(cacheKey);
+        String cacheKey = computeCacheKey(allSources, options);
+        cl_program cached = loadCachedBinary(cacheKey, options);
         if (cached != null) {
             Log.warn("ChunkyCL: Loaded cached OpenCL binary for " + kernelName);
             return cached;
@@ -186,7 +207,7 @@ public class ClContext {
             String[] headerNamesArg = numHeaders == 0 ? null : includeNames;
             int code;
             try {
-                code = clCompileProgram(kernelProgram, 1, deviceArray, compileOptions,
+                code = clCompileProgram(kernelProgram, 1, deviceArray, options.compile,
                         numHeaders, headersArg, headerNamesArg, null, null);
             } catch (CLException e) {
                 // Another thread may have re-enabled JOCL's global exceptions
@@ -248,7 +269,7 @@ public class ClContext {
             }
 
             int[] linkStatus = new int[1];
-            linked = clLinkProgram(context, 1, deviceArray, linkOptions, 1,
+            linked = clLinkProgram(context, 1, deviceArray, options.link, 1,
                     new cl_program[] { kernelProgram }, null, null, linkStatus);
             if (linked == null || linkStatus[0] != CL_SUCCESS) {
                 throw new RuntimeException("Failed to link CL program " + kernelName + ": code " + linkStatus[0]);
@@ -277,14 +298,14 @@ public class ClContext {
 
     // ---- Binary Cache Helpers ----
 
-    private String computeCacheKey(TreeMap<String, String> allSources) {
+    private String computeCacheKey(TreeMap<String, String> allSources, BuildOptions options) {
         try {
             MessageDigest digest = MessageDigest.getInstance("SHA-256");
             digest.update(device.name().getBytes(StandardCharsets.UTF_8));
             digest.update(device.versionString().getBytes(StandardCharsets.UTF_8));
             digest.update(getDriverVersion().getBytes(StandardCharsets.UTF_8));
-            digest.update(compileOptions.getBytes(StandardCharsets.UTF_8));
-            digest.update(linkOptions.getBytes(StandardCharsets.UTF_8));
+            digest.update(options.compile.getBytes(StandardCharsets.UTF_8));
+            digest.update(options.link.getBytes(StandardCharsets.UTF_8));
             for (Map.Entry<String, String> entry : allSources.entrySet()) {
                 digest.update(entry.getKey().getBytes(StandardCharsets.UTF_8));
                 digest.update(entry.getValue().getBytes(StandardCharsets.UTF_8));
@@ -316,7 +337,7 @@ public class ClContext {
         return PersistentSettings.settingsDirectory().toPath().resolve("opencl-cache");
     }
 
-    private cl_program loadCachedBinary(String cacheKey) {
+    private cl_program loadCachedBinary(String cacheKey, BuildOptions options) {
         cl_program program = null;
         try {
             Path cacheFile = getCacheDir().resolve(cacheKey + ".bin");
@@ -340,7 +361,7 @@ public class ClContext {
                 return null;
             }
 
-            int code = clBuildProgram(program, 1, deviceArray, deviceOptions, null, null);
+            int code = clBuildProgram(program, 1, deviceArray, options.device, null, null);
             CL.setExceptionsEnabled(true);
 
             if (code != CL_SUCCESS) {

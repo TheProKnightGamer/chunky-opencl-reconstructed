@@ -106,6 +106,29 @@ $JAVA_HOME/bin/java -Dchunky.home=$BENCH_HOME -DchunkyClHotReload=$REPO/src/main
   was an MMU fault (Xid 31) rather than a watchdog timeout.
 - On a shared machine, wrap `run.sh` in whatever GPU lock is in use.
 
+## Wavefront kernels
+
+The plugin renders with the wavefront kernels (`kernel/wavefront.h`) by default, and
+with the `render` megakernel for scenes that use emitter sampling or layered fog. A
+variant with `wf=1` times the wavefront kernels instead of `render`; `ext=N` and
+`con=N` set the register caps of the `wfExtend` and `wfConnect` programs (the plugin
+uses 80 and 96):
+
+```
+benchmark/harness/run.sh big4k "variants=$V/a/kernel/include|-cl-nv-maxrregcount=128;$V/a/kernel/include|-cl-nv-maxrregcount=128|wf=1,ext=80,con=96" \
+    names=mega,wave width=1920 height=1080 passes=2 rounds=4 wfProfile=1
+```
+
+`wfProfile=1` prints the GPU time of each wavefront kernel over one frame, and
+`wfChunk=N` renders the frame in chunks of N pixels, as the plugin does when the path
+state (432 bytes per pixel) would pass its 512 MB budget. The images are compared
+with the megakernel's like any other variant: they match bit for bit apart from
+compiler FMA contraction (99.9%+ of pixels identical).
+
+A `capture=1` variant is the experiment that justified the split: its render kernel
+writes one frame's first bounce rays to a trailing buffer, and a `traceCaptured`
+kernel in the same program re-traces them alone (see the header of `ClBench.java`).
+
 ## Emission maps
 
 `make_emissive_testpack.py <minecraft client jar> <out.zip>` builds a small synthetic
