@@ -1,35 +1,22 @@
 # OpenCL Plugin
 
-This is a plugin for [Chunky](https://github.com/chunky-dev/chunky) which harnesses the power of the GPU with OpenCL 1.2+ to accelerate rendering.
+This is a plugin for [Chunky](https://github.com/chunky-dev/chunky), which harnesses the power of the GPU with OpenCL 1.2+ to accelerate rendering.
 
-#### This is not the original, but a side project. I, myself do not know much Java, so the majority of this is a test to see how well AI can move features from chunky to chunky-opencl
+#### Disclaimer: This is not the original; for the original chunky-opencl, go to [chunky-opencl](https://github.com/chunky-dev/chunky-opencl). I, myself, do not know much Java, so this was largely coded by AI through a lot of trial and error.
 
-The original plugin is [chunky-dev/chunky-opencl](https://github.com/chunky-dev/chunky-opencl). This fork aims to make the GPU renderer produce the same image as Chunky's CPU path tracer, only much faster.
+The goal of this fork is for the GPU renderer to produce the same image as Chunky's CPU path tracer, only much faster.
 
-## Installation
-
-### Note: This requires the `2.5.0` snapshots.
-Download `chunky-opencl.jar` from the [latest release](https://github.com/TheProKnightGamer/chunky-opencl-reconstructed/releases/latest). In the Chunky Launcher, expand `Advanced Settings` and click on `Manage plugins`. In the `Plugin Manager` window click on `Add` and select the downloaded `.jar` file. Click on `Save` and start Chunky as usual.
-
-![image](https://user-images.githubusercontent.com/42661490/116319916-28ef2580-a76c-11eb-9f93-86d444a349fd.png)
-
-New and loaded scenes use `ChunkyClRenderer` (render) and `Chunky CL Preview Renderer` (preview) automatically. You can switch back to the CPU renderer in the `Advanced` tab.
-
-![image](https://user-images.githubusercontent.com/42661490/122492084-fc040580-cf99-11eb-9b08-b166dc25db41.png)
-
-The first launch takes a few minutes while the OpenCL kernels compile. The compiled kernels are cached, so later launches are much faster. A new plugin version that changes the kernels recompiles once.
-
-## Features
-
-Ported from Chunky's CPU renderer, with the CPU renderer as the reference for the image:
-
-* Water, with the water settings, volumetric water, ice and water optics. Water in-scattering follows the scene's sky and sun, so water no longer glows at night.
-* Subsurface scattering (leaves) and emitter sampling, including importance sampling.
-* Light blocks (`minecraft:light`) light the scene when emitters are on.
-* Animated textures (fire, lava, portals and so on), biome colours with 3D biomes, and the Hable and UE4 tone-mapping settings.
-* Skymaps and skyboxes baked at their own resolution.
-* The 2D map renders on the GPU.
-* Settings that do nothing on the GPU (render threads, CPU load, octree and BVH implementation) are greyed out while the GPU renderer is selected.
+## Features currently implemented:
+ - Full water rendering + settings! Volumetric water, water optics and ice. Water in-scattering follows the scene's sky and sun, so water no longer glows at night.
+ - Glass rendering!
+ - Emitter Sampling Strategies!
+ - Sun Sampling Strategies!
+ - Faster Map Using GPU!
+ - Emission maps from resource packs, with an `Emissive` tab (see below)!
+ - Light blocks (`minecraft:light`) light the scene when emitters are on.
+ - Subsurface scattering (leaves), animated textures (fire, lava, portals and so on), biome colours with 3D biomes, and the Hable and UE4 tone-mapping settings.
+ - Skymaps and skyboxes baked at their own resolution.
+ - Settings that do nothing on the GPU (render threads, CPU load, octree and BVH implementation) are greyed out while the GPU renderer is selected.
 
 ### Emission maps (`Emissive` tab)
 
@@ -40,9 +27,34 @@ Blocks can glow only where a resource pack's emission map says so, instead of ov
 * Per block, choose `Default`, `Emission map`, `Whole block` or `Off`, and optionally override its strength. The choices are saved with the scene.
 * Each pack's maps are converted once and cached, so loading a cached pack is nearly instant.
 
+## Installation
+
+### Note: This requires the `2.5.0` snapshots.
+Download `chunky-opencl.jar` from the [latest release](https://github.com/TheProKnightGamer/chunky-opencl-reconstructed/releases/latest). In the Chunky Launcher, expand `Advanced Settings` and click on `Manage plugins`. In the `Plugin Manager` window, click on `Add` and select the downloaded `.jar` file. Click on `Save` and start Chunky as usual.
+
+![image](https://user-images.githubusercontent.com/42661490/116319916-28ef2580-a76c-11eb-9f93-86d444a349fd.png)
+
+New and loaded scenes use `ChunkyClRenderer` (render) and `Chunky CL Preview Renderer` (preview) automatically. You can switch back to the CPU renderer in the `Advanced` tab.
+
+![image](https://user-images.githubusercontent.com/42661490/122492084-fc040580-cf99-11eb-9b08-b166dc25db41.png)
+
+The first launch takes a few minutes while the OpenCL kernels compile. The compiled kernels are cached, so later launches are much faster. A new plugin version that changes the kernels recompiles once.
+
 ## Performance
 
-The render uses a wavefront path tracer: each bounce is split into small kernels (trace, shade, shadow rays) instead of one large kernel per path, which keeps the GPU busier. It produces the same image as the single-kernel renderer.
+Rough performance with a Blackwell RTX 6000 Pro(I got temporary access to one :D) vs 14700k rendering four regions with all emitter sampling at full HD in march 25, 2026:
+<img width="1920" height="1011" alt="Screenshot from 2026-03-25 21-48-53" src="https://github.com/user-attachments/assets/4124bd21-b984-4f1e-8dfc-8009ccc6310f" />
+<img width="1920" height="1011" alt="Screenshot from 2026-03-25 21-46-48" src="https://github.com/user-attachments/assets/b7edfa75-ef16-43a0-96cb-cd401eec8825" />
+That's 84k samples per second vs 63 million samples per second, making complex scenes take mere minutes instead of several hours at 750x the speed of a high-end CPU!
+(I cut the CPU early as it took forever to render just four samples.)
+
+<img width="169" height="100" alt="comparison" src="https://github.com/user-attachments/assets/1c2be74d-f3cf-4911-a16f-f62c10e53a75" />
+
+The map used in the test renders can be found here at [Tax' Future City](https://www.curseforge.com/minecraft/worlds/taxfuturecity)
+
+### Since then
+
+The render now uses a wavefront path tracer: each bounce is split into small kernels (trace, shade, shadow rays) instead of one large kernel per path, which keeps the GPU busier. It produces the same image as the single-kernel renderer.
 
 Measured speedups for v1.0.23 against v1.0.22 (which was already 1.56–1.77x faster than v1.0.19):
 
@@ -72,7 +84,7 @@ Add these as JVM options in the Chunky Launcher. None are needed for normal use.
 | `-Dchunkycl.wavefront.stateMB=N` | `1024` | GPU memory budget for wavefront path state (432 bytes per pixel, also capped at a sixth of GPU memory). Larger frames render in chunks. |
 | `-Dchunkycl.nvMaxRegisters=N` | `128` | NVIDIA only: register cap for the render kernel. `0` leaves it to the compiler. |
 
-## Compatibility and limitations
+## Compatibility
 
 * Not compatible with the Denoising Plugin.
 * Scenes with emitter sampling (strategy other than `NONE`) or layered fog use the single-kernel renderer. The log says which renderer is used.
