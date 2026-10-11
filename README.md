@@ -4,37 +4,96 @@ This is a plugin for [Chunky](https://github.com/chunky-dev/chunky) which harnes
 
 #### This is not the original, but a side project. I, myself do not know much Java, so the majority of this is a test to see how well AI can move features from chunky to chunky-opencl
 
+The original plugin is [chunky-dev/chunky-opencl](https://github.com/chunky-dev/chunky-opencl). This fork aims to make the GPU renderer produce the same image as Chunky's CPU path tracer, only much faster.
+
 ## Installation
 
 ### Note: This requires the `2.5.0` snapshots.
-Download the [latest plugin release](https://github.com/chunky-dev/chunky-opencl/releases) and extract it. In the Chunky Launcher, expand `Advanced Settings` and click on `Manage plugins`. In the `Plugin Manager` window click on `Add` and select the `.jar` file in the extracted zip file. Click on `Save` and start Chunky as usual.
+Download `chunky-opencl.jar` from the [latest release](https://github.com/TheProKnightGamer/chunky-opencl-reconstructed/releases/latest). In the Chunky Launcher, expand `Advanced Settings` and click on `Manage plugins`. In the `Plugin Manager` window click on `Add` and select the downloaded `.jar` file. Click on `Save` and start Chunky as usual.
 
 ![image](https://user-images.githubusercontent.com/42661490/116319916-28ef2580-a76c-11eb-9f93-86d444a349fd.png)
 
-Select `ChunkyCL` as your renderer for the scene in the `Advanced` tab.
+New and loaded scenes use `ChunkyClRenderer` (render) and `Chunky CL Preview Renderer` (preview) automatically. You can switch back to the CPU renderer in the `Advanced` tab.
 
 ![image](https://user-images.githubusercontent.com/42661490/122492084-fc040580-cf99-11eb-9b08-b166dc25db41.png)
 
+The first launch takes a few minutes while the OpenCL kernels compile. The compiled kernels are cached, so later launches are much faster. A new plugin version that changes the kernels recompiles once.
+
+## Features
+
+Ported from Chunky's CPU renderer, with the CPU renderer as the reference for the image:
+
+* Water, with the water settings, volumetric water, ice and water optics. Water in-scattering follows the scene's sky and sun, so water no longer glows at night.
+* Subsurface scattering (leaves) and emitter sampling, including importance sampling.
+* Light blocks (`minecraft:light`) light the scene when emitters are on.
+* Animated textures (fire, lava, portals and so on), biome colours with 3D biomes, and the Hable and UE4 tone-mapping settings.
+* Skymaps and skyboxes baked at their own resolution.
+* The 2D map renders on the GPU.
+* Settings that do nothing on the GPU (render threads, CPU load, octree and BVH implementation) are greyed out while the GPU renderer is selected.
+
+### Emission maps (`Emissive` tab)
+
+Blocks can glow only where a resource pack's emission map says so, instead of over the whole texture. A torch's flame glows, its stick doesn't.
+
+* Reads LabPBR maps (alpha of `<texture>_s.png`) and OptiFine maps (`<texture>_e.png`, or the suffix from `optifine/emissive.properties`).
+* Add packs (zips or folders) in the `Emissive` tab, or use Chunky's own resource packs.
+* Per block, choose `Default`, `Emission map`, `Whole block` or `Off`, and optionally override its strength. The choices are saved with the scene.
+* Each pack's maps are converted once and cached, so loading a cached pack is nearly instant.
+
 ## Performance
 
-Rough performance with a RTX 2070 is around 400 times that of the traditional CPU renderer as of 2022-01-27.
+The render uses a wavefront path tracer: each bounce is split into small kernels (trace, shade, shadow rays) instead of one large kernel per path, which keeps the GPU busier. It produces the same image as the single-kernel renderer.
 
-Some settings have been added to improve render performance.
+Measured speedups for v1.0.23 against v1.0.22 (which was already 1.56–1.77x faster than v1.0.19):
+
+| GPU | Scene | Speedup |
+| --- | --- | --- |
+| RTX 3070, 1080p | 8-region terrain | 1.14x |
+| RTX 3070, 1080p | entity-heavy test scene | 1.17x |
+| RTX 3070, 1080p | underwater | 1.58x |
+| Intel UHD 770 | 8-region terrain | 1.59x |
+| Intel UHD 770 | entity-heavy test scene | 1.07x |
+
+Long renders stay under the GPU watchdog (Windows TDR, Linux display GPUs): launches are timed and resized as the render runs, and heavy frames are split across several launches.
+
+Tips:
 * Indoor scenes should disable sunlight under `Lighting`
 * Draw depth may be adjusted under `Advanced`
 * Draw entities may be unchecked under `Advanced`
-* OpenCL Device selector under `Advanced`
+* The OpenCL device can be selected in the `OpenCL` tab
 
-## Compatibility
+## Settings (JVM options)
+
+Add these as JVM options in the Chunky Launcher. None are needed for normal use.
+
+| Option | Default | Effect |
+| --- | --- | --- |
+| `-Dchunkycl.wavefront=false` | `true` | Render with the single-kernel renderer instead of the wavefront one. |
+| `-Dchunkycl.wavefront.stateMB=N` | `1024` | GPU memory budget for wavefront path state (432 bytes per pixel, also capped at a sixth of GPU memory). Larger frames render in chunks. |
+| `-Dchunkycl.nvMaxRegisters=N` | `128` | NVIDIA only: register cap for the render kernel. `0` leaves it to the compiler. |
+
+## Compatibility and limitations
 
 * Not compatible with the Denoising Plugin.
+* Scenes with emitter sampling (strategy other than `NONE`) or layered fog use the single-kernel renderer. The log says which renderer is used.
+* Blocks switched on in the `Emissive` tab that Chunky doesn't treat as lights (an ore, for example) light their surroundings through path tracing alone, which is noisier.
+* Small differences from the CPU renderer remain, mostly from the GPU's single-precision floats.
+
+## Troubleshooting
+
+* **`CL_OUT_OF_RESOURCES` or `CL_INVALID_COMMAND_QUEUE` when a render starts:** on the first render of a scene the log prints a `[ChunkyCL] GPU memory` report listing what each buffer uses. Compare the total with your GPU's free memory, then try fewer loaded chunks, a lower resolution, or a smaller `-Dchunkycl.wavefront.stateMB`.
+* **`GPU fp64 sample accumulator unavailable on this device` or `device lacks cl_khr_fp64`:** harmless. Samples are blended on the CPU in full precision instead, with the same result.
 
 ---
 
 ## Development
 This project is setup to work with IntelliJ and CLion. The base directory is intended to be opened in IntelliJ and the `src/main/opencl` directory in CLion.
 
+Build the plugin with `./gradlew build`. It needs Chunky `2.5.0-SNAPSHOT` in your local Maven repository (`./gradlew :chunky:publishToMavenLocal` in a Chunky checkout, as the CI does). The jar is written to `build/libs/chunky-opencl.jar`.
+
 For hot reloading, add `-DchunkyClHotReload="<src/main/opencl directory>"` as a JVM option.
+
+`benchmark/harness` times kernel changes on real scenes and checks that they don't change the image. See its [README](benchmark/harness/README.md).
 
 ## Copyright & License
 ChunkyCL is Copyright (c) 2021 - 2024, [ThatRedox](https://github.com/ThatRedox) and contributors.

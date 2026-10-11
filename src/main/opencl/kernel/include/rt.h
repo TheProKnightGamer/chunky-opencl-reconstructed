@@ -1,5 +1,5 @@
-#ifndef CHUNKYCLPLUGIN_WAVEFRONT_H
-#define CHUNKYCLPLUGIN_WAVEFRONT_H
+#ifndef CHUNKYCLPLUGIN_RT_H
+#define CHUNKYCLPLUGIN_RT_H
 
 #include "../opencl.h"
 

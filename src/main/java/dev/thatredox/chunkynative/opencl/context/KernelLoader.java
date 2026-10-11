@@ -58,12 +58,21 @@ public class KernelLoader {
      * @return OpenCL program.
      */
     public static cl_program loadProgram(ClContext context, String base, String kernelName) {
-        return context.loadProgram(file -> {
-            String program = instance.rawSourceReader.apply(base, file);
-            Matcher matcher = openclIncludeMatcher.matcher(program);
-            program = matcher.replaceFirst("// #include \"../opencl.h\"");
-            return program;
-        }, kernelName);
+        return context.loadProgram(file -> readSource(base, file), kernelName);
+    }
+
+    /**
+     * {@link #loadProgram(ClContext, String, String)} with its own NVIDIA register
+     * cap (ignored on other devices).
+     */
+    public static cl_program loadProgram(ClContext context, String base, String kernelName, int nvMaxRegisters) {
+        return context.loadProgram(file -> readSource(base, file), kernelName, nvMaxRegisters);
+    }
+
+    private static String readSource(String base, String file) {
+        String program = instance.rawSourceReader.apply(base, file);
+        Matcher matcher = openclIncludeMatcher.matcher(program);
+        return matcher.replaceFirst("// #include \"../opencl.h\"");
     }
 
     public static boolean canHotReload() {

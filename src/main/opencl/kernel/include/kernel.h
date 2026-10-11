@@ -297,97 +297,42 @@ void Hit_resolveSample(IntersectionRecord record, image2d_array_t atlas, Materia
 // OFFSET of the opaque block's face (the loop stepped past it into the block, whose
 // face it then rejected). Emitter NEE must not use this: it compares the hit
 // distance against the emitter's.
+//
+// traceScene's two halves are also separate functions, for the wavefront path
+// (kernel/wavefront.h), which traces in one kernel and shades in another:
+// traceSceneGeometry finds the closest surface and traceSceneResolve builds its
+// material sample. All three include the same fragments; traceScene stays one
+// function because splitting it made the megakernel 7-9% slower on an Intel iGPU.
+#define TRACE_MISS   0
+#define TRACE_HIT    1  // record set; the sample still needs traceSceneResolve
+#define TRACE_OPAQUE 2  // stopAtOpaque: record and an opaque sample set
+
 bool traceScene(SceneConfig self, image2d_array_t atlas, Ray ray, IntersectionRecord* record, MaterialSample* sample,
                 bool stopAtOpaque) {
-    IntersectionRecord tempRecord = *record;
-    bool hit = false;
-    hit |= Octree_octreeIntersect(self.octree, atlas, self.blockPalette, self.materialPalette, self.drawDepth, ray, &tempRecord);
-    if (stopAtOpaque && hit && tempRecord.hitKind == HIT_MATERIAL
-            && Material_isOpaqueAt(Material_get(self.materialPalette, tempRecord.material), atlas, tempRecord.texCoord)) {
-        // Only what the shadow loop reads: the distance, and an opaque sample.
-        *record = tempRecord;
-        record->geomNormal = record->normal;
-        sample->color = (float4)(0.0f, 0.0f, 0.0f, 1.0f);
-        sample->refractive = false;
-        sample->isWater = false;
-        return true;
-    }
-    hit |= Bvh_intersect(self.worldBvh, atlas, self.materialPalette, ray, &tempRecord);
-    hit |= Bvh_intersect(self.actorBvh, atlas, self.materialPalette, ray, &tempRecord);
-    {
-        IntersectionRecord waterRecord = tempRecord;
-        if (!hit) waterRecord.distance = record->distance;
-        bool waterHit = false;
-        if (ray.inWater) {
-            waterRecord.distance = hit ? (tempRecord.distance + EPS) : record->distance;
-            waterHit = Octree_exitWater(self.waterOctree, atlas, self.blockPalette, self.materialPalette, self.drawDepth, ray, &waterRecord);
-        } else if (Water_clipToBlocks(&self, ray, &waterRecord.distance)) {
-            waterHit = Octree_octreeIntersect(self.waterOctree, atlas, self.blockPalette, self.materialPalette, self.drawDepth, ray, &waterRecord);
-        }
-        if (waterHit && (!hit || waterRecord.distance < tempRecord.distance)) {
-            tempRecord = waterRecord;
-            tempRecord.hitKind |= HIT_FLAG_WATER_BRANCH;
-            hit = true;
-        }
-    }
-    if (self.waterPlaneEnabled) {
-        IntersectionRecord waterRecord = tempRecord;
-        if (!hit) waterRecord.distance = record->distance;
-        if (Water_planeIntersect(ray, self.waterPlaneHeight, self.octreeSize,
-                                 self.waterPlaneChunkClip,
-                                 self.chunkBitmap, self.chunkBitmapSize,
-                                 &waterRecord)) {
-            if (!hit || waterRecord.distance < tempRecord.distance) {
-                tempRecord = waterRecord;
-                // Wave shading is deferred to the unified water-shading block
-                // below (after geomNormal is pinned to the flat normal), so the
-                // flat plane normal survives for the anti-leak corrections
-                // instead of being clobbered by the blanket geomNormal=normal.
-                tempRecord.hitKind = HIT_WATER_PLANE;
-                hit = true;
-            }
-        }
-    }
-    if (self.cloudsEnabled) {
-        if (Cloud_intersect(self.cloudHeight, self.cloudSize, self.cloudOffsetX, self.cloudOffsetZ,
-                            self.cloudData, ray, &tempRecord, hit)) {
-            hit = true;
-        }
-    }
-    if (!hit) return false;
-    *record = tempRecord;
-    Hit_resolveSample(tempRecord, atlas, self.materialPalette, &self, false, sample);
-    record->geomNormal = record->normal;
-    if (sample->isWater) {
-        // Water BLOCKS (material >= 0) get opacity / custom color applied here;
-        // the water PLANE already did so in FillWaterSample.
-        if (record->material >= 0) {
-            sample->color.w = self.waterOpacity;
-            if (self.useCustomWaterColor) {
-                sample->color.xyz = self.waterColor;
-                sample->tintType = 0;
-            }
-        }
-        // Wave shading for BOTH water blocks and the water plane. geomNormal is
-        // pinned to the FLAT surface normal first (line 283 set it), THEN the
-        // shading perturbs record->normal — so the specular/refraction/diffuse
-        // anti-leak corrections run against the true flat normal, not the wave.
-        // Shadow rays skip wave shading: CPU traces both sun-NEE
-        // (PathTracer.getDirectLightAttenuation) and emitter-NEE
-        // (sampleEmitterFace) shadow rays with PreviewRayTracer, which never
-        // applies water shading. Sun/fog attenuation reads only distance +
-        // material sample; emitter NEE reads srec.normal only when the hit
-        // grazes the emitter face within 1e-4, where CPU uses the flat normal
-        // anyway.
-        if (record->normal.y != 0.0f && !(ray.flags & RAY_SHADOW)) {
-            record->geomNormal = record->normal;
-            float3 hitPos = ray.origin + ray.direction * record->distance;
-            Water_applyShading(record, self.waterShadingStrategy,
-                               self.animationTime, hitPos.x, hitPos.z, self.waterShaderParams,
-                               self.waterNormalMap, self.waterNormalMapW);
-        }
-    }
+#define TRACE_GEOMETRY_MISS return false
+#define TRACE_GEOMETRY_OPAQUE return true
+#include "frag_trace_geometry.h"
+#undef TRACE_GEOMETRY_MISS
+#undef TRACE_GEOMETRY_OPAQUE
+#include "frag_trace_resolve.h"
     return true;
+}
+
+int traceSceneGeometry(SceneConfig self, image2d_array_t atlas, Ray ray, IntersectionRecord* record,
+                       MaterialSample* sample, bool stopAtOpaque) {
+#define TRACE_GEOMETRY_MISS return TRACE_MISS
+#define TRACE_GEOMETRY_OPAQUE return TRACE_OPAQUE
+#include "frag_trace_geometry.h"
+#undef TRACE_GEOMETRY_MISS
+#undef TRACE_GEOMETRY_OPAQUE
+    *record = tempRecord;
+    return TRACE_HIT;
+}
+
+void traceSceneResolve(SceneConfig self, image2d_array_t atlas, Ray ray, IntersectionRecord* record,
+                       MaterialSample* sample) {
+    IntersectionRecord tempRecord = *record;
+#include "frag_trace_resolve.h"
 }
 
 // NOTE: `mat` is NEVER written and must not be read by callers. Its only

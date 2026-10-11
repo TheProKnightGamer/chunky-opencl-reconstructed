@@ -9,6 +9,7 @@ import dev.thatredox.chunkynative.opencl.util.ClIntBuffer;
 import dev.thatredox.chunkynative.opencl.util.ClMemory;
 import org.jocl.*;
 import se.llbit.chunky.renderer.*;
+import se.llbit.chunky.renderer.scene.FogMode;
 import se.llbit.chunky.renderer.scene.Scene;
 import se.llbit.log.Log;
 import se.llbit.util.TaskTracker;
@@ -122,6 +123,32 @@ public class OpenClPathTracingRenderer implements Renderer {
     private static final long NV_THREADS_PER_COMPUTE_UNIT = 1024L;
     /** Upper bound on the work-items in one dispatch; see {@link #threadCapFor}. */
     private long persistentThreadCap = PERSISTENT_THREAD_CAP;
+
+    // --- Wavefront path tracing (ContextManager.wavefront, kernel/wavefront.h) ---
+    // Instead of one megakernel launch tracing whole paths, each bounce is three
+    // small launches (trace, shade, shadow rays) over a chunk of pixels whose path
+    // state lives in wfState between launches. Same image, rendered faster on
+    // NVIDIA; scenes using a feature the wavefront kernels leave out render with
+    // the megakernel (wavefrontSupports).
+    /** WF_FIELDS in kernel/wavefront.h: floats of path state per pixel. */
+    static final int WAVEFRONT_STATE_FIELDS = 108;
+    /**
+     * Cap on the path-state buffer (also at most a sixth of the device's memory);
+     * frames needing more render in several chunks. Each chunk adds launch tails:
+     * on an RTX 3070 at 1080p, two chunks were 4-5% slower than one and four
+     * chunks 12-15% slower, so this is sized for 1080p in one chunk (896 MB).
+     * -Dchunkycl.wavefront.stateMB=N overrides.
+     */
+    private static final long WAVEFRONT_STATE_BUDGET_BYTES =
+            Long.getLong("chunkycl.wavefront.stateMB", 1024L) << 20;
+    /** Work-items per wavefront launch; the kernels loop over the chunk. */
+    private static final long WAVEFRONT_GLOBAL_SIZE = 65536L;
+    private cl_kernel wfPrimary, wfShade, wfExtend, wfConnect, wfFinish;
+    private ClMemory wfState = null;
+    /** Pixels wfState holds (the chunk size), -1 when unallocated. */
+    private int wfChunkCap = -1;
+    /** Which path the last render() used; switching invalidates the calibration. */
+    private Boolean lastRenderWavefront = null;
     /**
      * Work-group granularity. The global work size is always a multiple of this.
      * <p>Required for correctness of a sort: {@code local_work_size} is passed as
@@ -267,6 +294,120 @@ public class OpenClPathTracingRenderer implements Renderer {
         return sliceCount;
     }
 
+    /**
+     * Whether the wavefront kernels can render this scene: they leave out
+     * emitter-grid sampling and layered fog, which the megakernel still does.
+     */
+    private static boolean wavefrontSupports(Scene scene) {
+        if (scene.getEmittersEnabled()
+                && scene.getEmitterSamplingStrategy() != EmitterSamplingStrategy.NONE) {
+            return false;
+        }
+        return scene.fog.getFogMode() != FogMode.LAYERED;
+    }
+
+    private void createWavefrontKernels(ContextManager context) {
+        wfPrimary = clCreateKernel(context.wavefront.shade, "wfPrimary", null);
+        wfShade = clCreateKernel(context.wavefront.shade, "wfShade", null);
+        wfFinish = clCreateKernel(context.wavefront.shade, "wfFinish", null);
+        wfExtend = clCreateKernel(context.wavefront.extend, "wfExtend", null);
+        wfConnect = clCreateKernel(context.wavefront.connect, "wfConnect", null);
+    }
+
+    private cl_kernel[] wavefrontKernels() {
+        return new cl_kernel[]{wfPrimary, wfShade, wfExtend, wfConnect, wfFinish};
+    }
+
+    private void releaseWavefrontKernels() {
+        for (cl_kernel k : wavefrontKernels()) {
+            if (k != null) clReleaseKernel(k);
+        }
+        wfPrimary = wfShade = wfExtend = wfConnect = wfFinish = null;
+    }
+
+    /**
+     * (Re)allocate the path state for chunks of up to the budget's pixel count.
+     *
+     * @return false if the buffer could not be created (render with the megakernel)
+     */
+    private boolean ensureWavefrontState(ContextManager context, int pixelCount) {
+        long perPixel = (long) Sizeof.cl_float * WAVEFRONT_STATE_FIELDS;
+        long maxAlloc = context.device.getDeviceLongs(CL_DEVICE_MAX_MEM_ALLOC_SIZE, 1)[0];
+        long globalMem = context.device.getDeviceLongs(CL_DEVICE_GLOBAL_MEM_SIZE, 1)[0];
+        long budget = Math.min(WAVEFRONT_STATE_BUDGET_BYTES, Math.min(maxAlloc, globalMem / 6));
+        long maxPixels = Math.max(1, budget / perPixel);
+        // Equal chunks, rather than full ones and a small remainder.
+        long chunks = (pixelCount + maxPixels - 1) / maxPixels;
+        int cap = (int) Math.max(1, (pixelCount + chunks - 1) / chunks);
+        if (wfState != null && wfChunkCap == cap) return true;
+        releaseWavefrontState();
+        try {
+            wfState = new ClMemory(clCreateBuffer(context.context.context, CL_MEM_READ_WRITE,
+                    perPixel * cap, null, null));
+        } catch (CLException e) {
+            Log.warn("ChunkyCL: no memory for the wavefront path state (" + e.getMessage()
+                    + "); rendering with the single-kernel path tracer.");
+            return false;
+        }
+        wfChunkCap = cap;
+        return true;
+    }
+
+    private void releaseWavefrontState() {
+        if (wfState != null) {
+            wfState.close();
+            wfState = null;
+        }
+        wfChunkCap = -1;
+    }
+
+    /**
+     * Enqueues one pass of {@code ipl} iterations with the wavefront kernels, chunk
+     * by chunk: wfPrimary per iteration, then per branch and bounce wfExtend (from
+     * the second bounce), wfShade and wfConnect, then wfFinish writes the pixels.
+     * Every launch covers one step of one chunk, so no launch comes near the GPU
+     * watchdog however heavy the frame. The kernels share the render kernel's
+     * arguments; only the chunk and step arguments are set here.
+     */
+    private void dispatchWavefrontPass(cl_command_queue queue, int pixelCount, int ipl,
+                                       int branchCount, int rayDepth) {
+        int base0 = WAVEFRONT_ARG_BASE;
+        long[] global = {WAVEFRONT_GLOBAL_SIZE};
+        int bounces = Math.max(1, rayDepth - 1);
+        setIntKernelArg(wfFinish, wfIterationsArgIndex, ipl);
+        for (int chunkBase = 0; chunkBase < pixelCount; chunkBase += wfChunkCap) {
+            int chunkEnd = Math.min(pixelCount, chunkBase + wfChunkCap);
+            for (cl_kernel k : wavefrontKernels()) {
+                setIntKernelArg(k, wfPixelStartArgIndex, chunkBase);
+                setIntKernelArg(k, wfPixelStrideArgIndex, (int) WAVEFRONT_GLOBAL_SIZE);
+                setIntKernelArg(k, wfPixelCountArgIndex, chunkEnd);
+                setIntKernelArg(k, base0 + 1, chunkBase);
+                setIntKernelArg(k, base0 + 2, wfChunkCap);
+                setIntKernelArg(k, base0 + 3, 0);
+            }
+            for (int it = 0; it < ipl; it++) {
+                setIntKernelArg(wfPrimary, base0 + 3, it);
+                clEnqueueNDRangeKernel(queue, wfPrimary, 1, null, global, null, 0, null, null);
+                for (int branch = 0; branch < branchCount; branch++) {
+                    for (int bounce = 0; bounce < bounces; bounce++) {
+                        if (bounce > 0) {
+                            clEnqueueNDRangeKernel(queue, wfExtend, 1, null, global, null, 0, null, null);
+                        }
+                        setIntKernelArg(wfShade, base0 + 3, bounce);
+                        clEnqueueNDRangeKernel(queue, wfShade, 1, null, global, null, 0, null, null);
+                        clEnqueueNDRangeKernel(queue, wfConnect, 1, null, global, null, 0, null, null);
+                    }
+                }
+            }
+            clEnqueueNDRangeKernel(queue, wfFinish, 1, null, global, null, 0, null, null);
+        }
+    }
+
+    // Arg indices of the render parameters the wavefront pass rewrites; set by render().
+    private int wfIterationsArgIndex, wfPixelStartArgIndex, wfPixelStrideArgIndex, wfPixelCountArgIndex;
+    /** Index of the first wavefront-only argument (st); the render parameters come before it. */
+    private int WAVEFRONT_ARG_BASE;
+
     // Reusable scratch for clSetKernelArg(int) calls. Avoids allocating a new
     // int[1] + Pointer per arg per render(). clSetKernelArg copies the value
     // synchronously so the same scratch can serve every int arg, written and
@@ -319,6 +460,7 @@ public class OpenClPathTracingRenderer implements Renderer {
             cachedPassFloatBuffers[i] = null;
         }
         calibratedForPixels = -1;
+        releaseWavefrontState();
     }
 
     @Override
@@ -353,10 +495,29 @@ public class OpenClPathTracingRenderer implements Renderer {
         if (cachedKernel == null || cachedCtx != context) {
             if (cachedKernel != null) clReleaseKernel(cachedKernel);
             cachedKernel = clCreateKernel(context.renderer.kernel, "render", null);
+            releaseWavefrontKernels();
+            if (context.wavefront != null) createWavefrontKernels(context);
             cachedCtx = context;
             persistentThreadCap = threadCapFor(context.device);
             releaseAllCached();
         }
+
+        final boolean useWavefront = context.wavefront != null && wavefrontSupports(scene)
+                && ensureWavefrontState(context, pixelCount);
+        if (lastRenderWavefront == null || lastRenderWavefront != useWavefront) {
+            // The launch-size calibration was measured with the other path.
+            calibratedForPixels = -1;
+            cachedIpl = 1;
+            cachedSliceCount = -1;
+            lastRenderWavefront = useWavefront;
+            if (context.wavefront != null) {
+                Log.info(useWavefront
+                        ? "ChunkyCL: rendering with the wavefront path tracer"
+                        : "ChunkyCL: rendering with the single-kernel path tracer "
+                                + "(the scene uses emitter sampling or layered fog)");
+            }
+        }
+        if (!useWavefront) releaseWavefrontState();
         if (useGpuAcc && cachedAccumulateKernel == null) {
             cachedAccumulateKernel = clCreateKernel(context.accumulator.kernel, "accumulate", null);
         }
@@ -464,81 +625,102 @@ public class OpenClPathTracingRenderer implements Renderer {
         try {
             // render() runs entirely on this thread, so no lock is passed to ClCamera.generate.
             camera.generate(null, true);
-            int argIndex = 0;
-            clSetKernelArg(kernel, argIndex++, Sizeof.cl_mem, Pointer.to(camera.projectorType.get()));
-            clSetKernelArg(kernel, argIndex++, Sizeof.cl_mem, Pointer.to(camera.cameraSettings.get()));
-            clSetKernelArg(kernel, argIndex++, Sizeof.cl_mem, Pointer.to(
-                    camera.apertureMaskBuffer != null ? camera.apertureMaskBuffer.get() : emptyGridPlaceholder.get()));
-            setIntKernelArg(kernel, argIndex++, camera.apertureMaskWidth);
-            clSetKernelArg(kernel, argIndex++, Sizeof.cl_mem, Pointer.to(sceneLoader.getOctreeDepth().get()));
-            clSetKernelArg(kernel, argIndex++, Sizeof.cl_mem, Pointer.to(sceneLoader.getOctreeData().get()));
-            clSetKernelArg(kernel, argIndex++, Sizeof.cl_mem, Pointer.to(sceneLoader.getWaterOctreeDepth().get()));
-            clSetKernelArg(kernel, argIndex++, Sizeof.cl_mem, Pointer.to(sceneLoader.getWaterOctreeData().get()));
-            clSetKernelArg(kernel, argIndex++, Sizeof.cl_mem, Pointer.to(sceneLoader.getBlockPalette().get()));
-            clSetKernelArg(kernel, argIndex++, Sizeof.cl_mem, Pointer.to(sceneLoader.getQuadPalette().get()));
-            clSetKernelArg(kernel, argIndex++, Sizeof.cl_mem, Pointer.to(sceneLoader.getAabbPalette().get()));
-            clSetKernelArg(kernel, argIndex++, Sizeof.cl_mem, Pointer.to(sceneLoader.getWorldBvh().get()));
-            clSetKernelArg(kernel, argIndex++, Sizeof.cl_mem, Pointer.to(sceneLoader.getActorBvh().get()));
-            clSetKernelArg(kernel, argIndex++, Sizeof.cl_mem, Pointer.to(sceneLoader.getTrigPalette().get()));
-            clSetKernelArg(kernel, argIndex++, Sizeof.cl_mem, Pointer.to(sceneLoader.getTexturePalette().getAtlas()));
-            clSetKernelArg(kernel, argIndex++, Sizeof.cl_mem, Pointer.to(sceneLoader.getMaterialPalette().get()));
-            // LDS material-palette cache. Cap chosen to fit comfortably in
-            // typical workgroup-shared memory (modern GPUs have >=64 KB per
-            // workgroup; 8192 ints = 32 KB leaves room for other __local
-            // allocations and lets material-rich modded scenes (>2048 word
-            // palettes) fully cache instead of falling through to global
-            // for the tail.
-            // Off on NVIDIA: there the palette reads are L1 hits anyway, and the up to
-            // 32 KB of shared memory per work-group comes out of the same on-chip
-            // storage that holds the kernel's register spills (3% faster without it
-            // on an RTX 3070).
-            int matCacheWords = context.device.supportsNvCompilerOptions()
-                    ? 0 : Math.min(8192, sceneLoader.getMaterialPalette().wordCount());
-            setIntKernelArg(kernel, argIndex++, matCacheWords);
-            clSetKernelArg(kernel, argIndex++, Sizeof.cl_uint * Math.max(matCacheWords, 1), null);
-            clSetKernelArg(kernel, argIndex++, Sizeof.cl_mem, Pointer.to(sceneLoader.getSky().skyTexture.get()));
-            clSetKernelArg(kernel, argIndex++, Sizeof.cl_mem, Pointer.to(sceneLoader.getSky().skyIntensity.get()));
-            clSetKernelArg(kernel, argIndex++, Sizeof.cl_mem, Pointer.to(sceneLoader.getSun().get()));
-            clSetKernelArg(kernel, argIndex++, Sizeof.cl_mem, Pointer.to(dynamicConfig.get()));
-            clSetKernelArg(kernel, argIndex++, Sizeof.cl_mem, Pointer.to(emitterIntensityMem.get()));
-            clSetKernelArg(kernel, argIndex++, Sizeof.cl_mem, Pointer.to(
-                    sceneLoader.getEmitterPositions() != null ? sceneLoader.getEmitterPositions().get() : emptyGridPlaceholder.get()));
-            clSetKernelArg(kernel, argIndex++, Sizeof.cl_mem, Pointer.to(
-                    sceneLoader.getPositionIndexes() != null ? sceneLoader.getPositionIndexes().get() : emptyGridPlaceholder.get()));
-            clSetKernelArg(kernel, argIndex++, Sizeof.cl_mem, Pointer.to(
-                    sceneLoader.getConstructedGrid() != null ? sceneLoader.getConstructedGrid().get() : emptyGridPlaceholder.get()));
-            clSetKernelArg(kernel, argIndex++, Sizeof.cl_mem, Pointer.to(
-                    sceneLoader.getGridConfig() != null ? sceneLoader.getGridConfig().get() : emptyGridPlaceholder.get()));
-            clSetKernelArg(kernel, argIndex++, Sizeof.cl_mem, Pointer.to(clCanvasConfig.get()));
-            clSetKernelArg(kernel, argIndex++, Sizeof.cl_mem, Pointer.to(clRayDepth.get()));
-            int iterationsArgIndex = argIndex;
+            // Every kernel that renders paths takes the same parameters (the wavefront
+            // kernels add their chunk state after them), so bind them all alike.
+            int iterationsArgIndex = -1, outputArgIndex = -1;
+            int pixelStartArgIndex = -1, pixelStrideArgIndex = -1, pixelCountArgIndex = -1;
             int iterationsPerLaunch = cachedIpl;
-            setIntKernelArg(kernel, argIndex++, iterationsPerLaunch);
-            clSetKernelArg(kernel, argIndex++, Sizeof.cl_mem, Pointer.to(sceneLoader.getFogData().get()));
-            clSetKernelArg(kernel, argIndex++, Sizeof.cl_mem, Pointer.to(sceneLoader.getWaterConfig().get()));
-            clSetKernelArg(kernel, argIndex++, Sizeof.cl_mem, Pointer.to(sceneLoader.getRenderConfig().get()));
-            clSetKernelArg(kernel, argIndex++, Sizeof.cl_mem, Pointer.to(sceneLoader.getCloudData().get()));
-            clSetKernelArg(kernel, argIndex++, Sizeof.cl_mem, Pointer.to(sceneLoader.getWaterNormalMap().get()));
-            setIntKernelArg(kernel, argIndex++, sceneLoader.getWaterNormalMapWidth());
-            clSetKernelArg(kernel, argIndex++, Sizeof.cl_mem, Pointer.to(sceneLoader.getBiomeData().get()));
-            setIntKernelArg(kernel, argIndex++, sceneLoader.getBiomeDataSize());
-            clSetKernelArg(kernel, argIndex++, Sizeof.cl_mem, Pointer.to(sceneLoader.getChunkBitmap().get()));
-            setIntKernelArg(kernel, argIndex++, sceneLoader.getChunkBitmapSize());
-            int outputArgIndex = argIndex;
-            // Output buffer arg: GPU-accumulator path writes into a single
-            // non-pinned buffer (consumed by the accumulate kernel, never
-            // mapped to host); CPU-blend path uses ping-pong slot 0.
-            ClMemory initialOutputBuffer = useGpuAcc ? cachedAccPassBuffer : cachedOutputBuffers[0];
-            clSetKernelArg(kernel, argIndex++, Sizeof.cl_mem, Pointer.to(initialOutputBuffer.get()));
-            // Pixel walk (start, stride, count) consumed by the kernel's outer
-            // loop. dispatchFrame() rewrites these per slice; the warm-up below
-            // overrides them for its small subset.
-            int pixelStartArgIndex = argIndex;
-            setIntKernelArg(kernel, argIndex++, 0);
-            int pixelStrideArgIndex = argIndex;
-            setIntKernelArg(kernel, argIndex++, (int) persistentThreadCap);
-            int pixelCountArgIndex = argIndex;
-            setIntKernelArg(kernel, argIndex++, pixelCount);
+            cl_kernel[] argKernels = useWavefront
+                    ? new cl_kernel[]{kernel, wfPrimary, wfShade, wfExtend, wfConnect, wfFinish}
+                    : new cl_kernel[]{kernel};
+            for (cl_kernel k : argKernels) {
+                int argIndex = 0;
+                clSetKernelArg(k, argIndex++, Sizeof.cl_mem, Pointer.to(camera.projectorType.get()));
+                clSetKernelArg(k, argIndex++, Sizeof.cl_mem, Pointer.to(camera.cameraSettings.get()));
+                clSetKernelArg(k, argIndex++, Sizeof.cl_mem, Pointer.to(
+                        camera.apertureMaskBuffer != null ? camera.apertureMaskBuffer.get() : emptyGridPlaceholder.get()));
+                setIntKernelArg(k, argIndex++, camera.apertureMaskWidth);
+                clSetKernelArg(k, argIndex++, Sizeof.cl_mem, Pointer.to(sceneLoader.getOctreeDepth().get()));
+                clSetKernelArg(k, argIndex++, Sizeof.cl_mem, Pointer.to(sceneLoader.getOctreeData().get()));
+                clSetKernelArg(k, argIndex++, Sizeof.cl_mem, Pointer.to(sceneLoader.getWaterOctreeDepth().get()));
+                clSetKernelArg(k, argIndex++, Sizeof.cl_mem, Pointer.to(sceneLoader.getWaterOctreeData().get()));
+                clSetKernelArg(k, argIndex++, Sizeof.cl_mem, Pointer.to(sceneLoader.getBlockPalette().get()));
+                clSetKernelArg(k, argIndex++, Sizeof.cl_mem, Pointer.to(sceneLoader.getQuadPalette().get()));
+                clSetKernelArg(k, argIndex++, Sizeof.cl_mem, Pointer.to(sceneLoader.getAabbPalette().get()));
+                clSetKernelArg(k, argIndex++, Sizeof.cl_mem, Pointer.to(sceneLoader.getWorldBvh().get()));
+                clSetKernelArg(k, argIndex++, Sizeof.cl_mem, Pointer.to(sceneLoader.getActorBvh().get()));
+                clSetKernelArg(k, argIndex++, Sizeof.cl_mem, Pointer.to(sceneLoader.getTrigPalette().get()));
+                clSetKernelArg(k, argIndex++, Sizeof.cl_mem, Pointer.to(sceneLoader.getTexturePalette().getAtlas()));
+                clSetKernelArg(k, argIndex++, Sizeof.cl_mem, Pointer.to(sceneLoader.getMaterialPalette().get()));
+                // LDS material-palette cache. Cap chosen to fit comfortably in
+                // typical workgroup-shared memory (modern GPUs have >=64 KB per
+                // workgroup; 8192 ints = 32 KB leaves room for other __local
+                // allocations and lets material-rich modded scenes (>2048 word
+                // palettes) fully cache instead of falling through to global
+                // for the tail.
+                // Off on NVIDIA: there the palette reads are L1 hits anyway, and the up to
+                // 32 KB of shared memory per work-group comes out of the same on-chip
+                // storage that holds the kernel's register spills (3% faster without it
+                // on an RTX 3070).
+                // The wavefront kernels run it off everywhere: they are launched many times
+                // per pass, and each launch would copy the whole palette again.
+                int matCacheWords = context.device.supportsNvCompilerOptions() || k != kernel
+                        ? 0 : Math.min(8192, sceneLoader.getMaterialPalette().wordCount());
+                setIntKernelArg(k, argIndex++, matCacheWords);
+                clSetKernelArg(k, argIndex++, Sizeof.cl_uint * Math.max(matCacheWords, 1), null);
+                clSetKernelArg(k, argIndex++, Sizeof.cl_mem, Pointer.to(sceneLoader.getSky().skyTexture.get()));
+                clSetKernelArg(k, argIndex++, Sizeof.cl_mem, Pointer.to(sceneLoader.getSky().skyIntensity.get()));
+                clSetKernelArg(k, argIndex++, Sizeof.cl_mem, Pointer.to(sceneLoader.getSun().get()));
+                clSetKernelArg(k, argIndex++, Sizeof.cl_mem, Pointer.to(dynamicConfig.get()));
+                clSetKernelArg(k, argIndex++, Sizeof.cl_mem, Pointer.to(emitterIntensityMem.get()));
+                clSetKernelArg(k, argIndex++, Sizeof.cl_mem, Pointer.to(
+                        sceneLoader.getEmitterPositions() != null ? sceneLoader.getEmitterPositions().get() : emptyGridPlaceholder.get()));
+                clSetKernelArg(k, argIndex++, Sizeof.cl_mem, Pointer.to(
+                        sceneLoader.getPositionIndexes() != null ? sceneLoader.getPositionIndexes().get() : emptyGridPlaceholder.get()));
+                clSetKernelArg(k, argIndex++, Sizeof.cl_mem, Pointer.to(
+                        sceneLoader.getConstructedGrid() != null ? sceneLoader.getConstructedGrid().get() : emptyGridPlaceholder.get()));
+                clSetKernelArg(k, argIndex++, Sizeof.cl_mem, Pointer.to(
+                        sceneLoader.getGridConfig() != null ? sceneLoader.getGridConfig().get() : emptyGridPlaceholder.get()));
+                clSetKernelArg(k, argIndex++, Sizeof.cl_mem, Pointer.to(clCanvasConfig.get()));
+                clSetKernelArg(k, argIndex++, Sizeof.cl_mem, Pointer.to(clRayDepth.get()));
+                iterationsArgIndex = argIndex;
+                setIntKernelArg(k, argIndex++, iterationsPerLaunch);
+                clSetKernelArg(k, argIndex++, Sizeof.cl_mem, Pointer.to(sceneLoader.getFogData().get()));
+                clSetKernelArg(k, argIndex++, Sizeof.cl_mem, Pointer.to(sceneLoader.getWaterConfig().get()));
+                clSetKernelArg(k, argIndex++, Sizeof.cl_mem, Pointer.to(sceneLoader.getRenderConfig().get()));
+                clSetKernelArg(k, argIndex++, Sizeof.cl_mem, Pointer.to(sceneLoader.getCloudData().get()));
+                clSetKernelArg(k, argIndex++, Sizeof.cl_mem, Pointer.to(sceneLoader.getWaterNormalMap().get()));
+                setIntKernelArg(k, argIndex++, sceneLoader.getWaterNormalMapWidth());
+                clSetKernelArg(k, argIndex++, Sizeof.cl_mem, Pointer.to(sceneLoader.getBiomeData().get()));
+                setIntKernelArg(k, argIndex++, sceneLoader.getBiomeDataSize());
+                clSetKernelArg(k, argIndex++, Sizeof.cl_mem, Pointer.to(sceneLoader.getChunkBitmap().get()));
+                setIntKernelArg(k, argIndex++, sceneLoader.getChunkBitmapSize());
+                outputArgIndex = argIndex;
+                // Output buffer arg: GPU-accumulator path writes into a single
+                // non-pinned buffer (consumed by the accumulate kernel, never
+                // mapped to host); CPU-blend path uses ping-pong slot 0.
+                ClMemory initialOutputBuffer = useGpuAcc ? cachedAccPassBuffer : cachedOutputBuffers[0];
+                clSetKernelArg(k, argIndex++, Sizeof.cl_mem, Pointer.to(initialOutputBuffer.get()));
+                // Pixel walk (start, stride, count) consumed by the kernel's outer
+                // loop. dispatchFrame() rewrites these per slice; the warm-up below
+                // overrides them for its small subset.
+                pixelStartArgIndex = argIndex;
+                setIntKernelArg(k, argIndex++, 0);
+                pixelStrideArgIndex = argIndex;
+                setIntKernelArg(k, argIndex++, (int) persistentThreadCap);
+                pixelCountArgIndex = argIndex;
+                setIntKernelArg(k, argIndex++, pixelCount);
+            }
+            if (useWavefront) {
+                WAVEFRONT_ARG_BASE = pixelCountArgIndex + 1;
+                wfIterationsArgIndex = iterationsArgIndex;
+                wfPixelStartArgIndex = pixelStartArgIndex;
+                wfPixelStrideArgIndex = pixelStrideArgIndex;
+                wfPixelCountArgIndex = pixelCountArgIndex;
+                for (cl_kernel k : wavefrontKernels()) {
+                    clSetKernelArg(k, WAVEFRONT_ARG_BASE, Sizeof.cl_mem, Pointer.to(wfState.get()));
+                }
+            }
             int[] cfg = new int[5];
             // Cached pointers/arrays for the inner loop. Recreating Pointer.to(...)
             // every iteration would otherwise allocate per spp pass.
@@ -596,7 +778,16 @@ public class OpenClPathTracingRenderer implements Renderer {
             clEnqueueWriteBuffer(context.context.queue, emitterIntensityMem.get(), CL_TRUE, 0,
                     Sizeof.cl_float, emitterIntensityPtr, 0, null, null);
 
-            if (calibratedForPixels != pixelCount) {
+            if (useWavefront) {
+                // No warm-up: a wavefront launch is one step over one chunk, far below
+                // the watchdog however heavy the frame, so slicing is never needed.
+                if (calibratedForPixels != pixelCount) {
+                    iterationsPerLaunch = 1;
+                    cachedIpl = 1;
+                    calibratedForPixels = pixelCount;
+                }
+                cachedSliceCount = 1;
+            } else if (calibratedForPixels != pixelCount) {
                 // Warm-up: render a REPRESENTATIVE sample of the frame and use it to
                 // size the first pass. The kernel's (start, stride, count) walk makes
                 // this a one-liner: with pixelStart = 0, a global size of G and a
@@ -769,9 +960,13 @@ public class OpenClPathTracingRenderer implements Renderer {
                     // scores the measurement against the right configuration.
                     int usedSliceCount = cachedSliceCount;
                     int usedIpl = iterationsPerLaunch;
-                    dispatchFrame(context.context.queue, kernel,
-                            pixelStartArgIndex, pixelStrideArgIndex, pixelCountArgIndex,
-                            pixelCount, usedSliceCount, dispatchGlobal);
+                    if (useWavefront) {
+                        dispatchWavefrontPass(context.context.queue, pixelCount, usedIpl, cfg[4], rayDepth);
+                    } else {
+                        dispatchFrame(context.context.queue, kernel,
+                                pixelStartArgIndex, pixelStrideArgIndex, pixelCountArgIndex,
+                                pixelCount, usedSliceCount, dispatchGlobal);
+                    }
 
                     int passSpp = usedIpl * Math.max(1, scene.getCurrentBranchCount());
                     // Weights computed in fp64 the same way as the CPU loop:
@@ -892,11 +1087,16 @@ public class OpenClPathTracingRenderer implements Renderer {
                             Sizeof.cl_float, emitterIntensityPtr, 0, null, null);
                 }
                 clSetKernelArg(kernel, outputArgIndex, Sizeof.cl_mem, outputArgPtrs[curIdx]);
+                if (useWavefront) clSetKernelArg(wfFinish, outputArgIndex, Sizeof.cl_mem, outputArgPtrs[curIdx]);
                 int usedSliceCount = cachedSliceCount;
                 int usedIpl = iterationsPerLaunch;
-                dispatchFrame(context.context.queue, kernel,
-                        pixelStartArgIndex, pixelStrideArgIndex, pixelCountArgIndex,
-                        pixelCount, usedSliceCount, dispatchGlobal);
+                if (useWavefront) {
+                    dispatchWavefrontPass(context.context.queue, pixelCount, usedIpl, cfg[4], rayDepth);
+                } else {
+                    dispatchFrame(context.context.queue, kernel,
+                            pixelStartArgIndex, pixelStrideArgIndex, pixelCountArgIndex,
+                            pixelCount, usedSliceCount, dispatchGlobal);
+                }
                 int passSpp = usedIpl * Math.max(1, scene.getCurrentBranchCount());
                 cl_event readEvent = new cl_event();
                 // Map the pinned output buffer for read. With pinned memory
